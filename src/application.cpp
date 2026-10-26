@@ -34,6 +34,8 @@ int Application::run(const RunOptions& options) {
     SetTargetFPS(0);  // vsync-limited
 
     m_params.spin = options.spin;
+    if (options.rotationSpeed >= 0.0f) m_params.rotationSpeed = options.rotationSpeed;
+    if (options.temperature > 0.0f) m_params.temperature = options.temperature;
     m_params.showUi = !options.noUi;
     m_params.paused = options.paused;
     if (options.quality >= 0 && options.quality < kQualityCount) {

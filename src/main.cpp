@@ -21,6 +21,8 @@ void printUsage() {
         "  --yaw RAD          camera azimuth in radians (default 0.70)\n"
         "  --pitch RAD        camera elevation in radians (default 0.16)\n"
         "  --spin A           dimensionless spin a/M, 0..0.998 (default 0.6)\n"
+        "  --rotation X       disk rotation speed multiplier (default 1.0)\n"
+        "  --temperature K    disk temperature in kelvin (default 6800)\n"
         "  --time SECONDS     initial disk animation phase\n"
         "  --paused           start with the disk animation paused\n"
         "  --no-ui            hide the control panel\n"
@@ -97,6 +99,10 @@ int main(int argc, char** argv) {
             options.yaw = static_cast<float>(std::atof(next("--yaw")));
         } else if (std::strcmp(arg, "--pitch") == 0) {
             options.pitch = static_cast<float>(std::atof(next("--pitch")));
+        } else if (std::strcmp(arg, "--rotation") == 0) {
+            options.rotationSpeed = static_cast<float>(std::atof(next("--rotation")));
+        } else if (std::strcmp(arg, "--temperature") == 0) {
+            options.temperature = static_cast<float>(std::atof(next("--temperature")));
         } else if (std::strcmp(arg, "--time") == 0) {
             options.startTime = static_cast<float>(std::atof(next("--time")));
         } else if (std::strcmp(arg, "--bench") == 0) {
