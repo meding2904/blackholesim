@@ -74,21 +74,14 @@ std::string resolveAssetPath(const std::string& relative) {
 bool Renderer::initialize(std::string& error) {
     if (!loadShaders(error)) return false;
 
-    m_sky = createSkyTexture();
-    if (m_sky.id == 0) {
-        error = "Failed to create the procedural sky texture.";
-        return false;
-    }
     m_diskNoise = createDiskNoiseTexture();
     if (m_diskNoise.id == 0) {
         error = "Failed to create the procedural disk turbulence texture.";
         return false;
     }
 
-    // Sampler units are fixed (1..3); raylib's 2D batch uses unit 0.
-    int unit = 1;
-    SetShaderValue(m_sceneShader, m_scene.sky, &unit, SHADER_UNIFORM_INT);
-    unit = 2;
+    // Sampler units are fixed (2..3); raylib's 2D batch uses unit 0.
+    int unit = 2;
     SetShaderValue(m_sceneShader, m_scene.noise, &unit, SHADER_UNIFORM_INT);
 
     m_initialized = true;
@@ -131,18 +124,19 @@ bool Renderer::loadShaders(std::string& error) {
     m_scene.diskGain = GetShaderLocation(m_sceneShader, "uDiskGain");
     m_scene.diskDensity = GetShaderLocation(m_sceneShader, "uDiskDensity");
     m_scene.stepSize = GetShaderLocation(m_sceneShader, "uStepSize");
+    m_scene.spin = GetShaderLocation(m_sceneShader, "uSpin");
+    m_scene.horizon = GetShaderLocation(m_sceneShader, "uHorizon");
     m_scene.maxSteps = GetShaderLocation(m_sceneShader, "uMaxSteps");
     m_scene.aaSamples = GetShaderLocation(m_sceneShader, "uAASamples");
     m_scene.starGain = GetShaderLocation(m_sceneShader, "uStarGain");
-    m_scene.sky = GetShaderLocation(m_sceneShader, "uSky");
     m_scene.noise = GetShaderLocation(m_sceneShader, "uNoise");
 
-    if (m_scene.resolution < 0 || m_scene.sky < 0 || m_scene.noise < 0) {
+    if (m_scene.resolution < 0 || m_scene.noise < 0) {
         char detail[192];
         std::snprintf(detail, sizeof(detail),
-                      "Black hole shader is missing uniforms: res=%d cam=%d sky=%d noise=%d "
+                      "Black hole shader is missing uniforms: res=%d cam=%d noise=%d "
                       "step=%d max=%d",
-                      m_scene.resolution, m_scene.camPos, m_scene.sky, m_scene.noise,
+                      m_scene.resolution, m_scene.camPos, m_scene.noise,
                       m_scene.stepSize, m_scene.maxSteps);
         error = detail;
         return false;
@@ -169,7 +163,6 @@ bool Renderer::loadShaders(std::string& error) {
 void Renderer::shutdown() {
     releaseTargets();
     if (m_initialized) {
-        UnloadTexture(m_sky);
         UnloadTexture(m_diskNoise);
         m_initialized = false;
     }
@@ -264,13 +257,20 @@ void Renderer::drawScene(const CameraFrame& camera, const SimulationParameters& 
     SetShaderValue(m_sceneShader, m_scene.camForward, &forward, SHADER_UNIFORM_VEC3);
     SetShaderValue(m_sceneShader, m_scene.camRight, &right, SHADER_UNIFORM_VEC3);
     SetShaderValue(m_sceneShader, m_scene.camUp, &up, SHADER_UNIFORM_VEC3);
+    if (std::getenv("BH_DUMP_CAM") != nullptr) {
+        std::printf(
+            "CAM %.6f %.6f %.6f | FWD %.6f %.6f %.6f | RIGHT %.6f %.6f %.6f | UP %.6f %.6f %.6f"
+            " | RES %d %d\n",
+            position.x, position.y, position.z, forward.x, forward.y, forward.z, right.x, right.y,
+            right.z, up.x, up.y, up.z, m_sceneWidth, m_sceneHeight);
+    }
 
     const float tanHalfFov = std::tan(kVerticalFovDegrees * 0.5f * DEG2RAD);
     SetShaderValue(m_sceneShader, m_scene.tanHalfFov, &tanHalfFov, SHADER_UNIFORM_FLOAT);
     SetShaderValue(m_sceneShader, m_scene.time, &diskTime, SHADER_UNIFORM_FLOAT);
 
     const float diskVisible = params.diskVisible ? 1.0f : 0.0f;
-    const float diskInner = kInnerDiskRadius;
+    const float diskInner = params.iscoRadius();
     const float diskOuter = params.outerRadius;
     const float rotation = params.rotationSpeed;
     const float tempScale = params.temperature;
@@ -289,11 +289,14 @@ void Renderer::drawScene(const CameraFrame& camera, const SimulationParameters& 
     SetShaderValue(m_sceneShader, m_scene.diskGain, &gain, SHADER_UNIFORM_FLOAT);
     SetShaderValue(m_sceneShader, m_scene.diskDensity, &density, SHADER_UNIFORM_FLOAT);
     SetShaderValue(m_sceneShader, m_scene.stepSize, &stepSize, SHADER_UNIFORM_FLOAT);
+    const float spin = params.spin;
+    const float horizon = params.horizonRadius();
+    SetShaderValue(m_sceneShader, m_scene.spin, &spin, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(m_sceneShader, m_scene.horizon, &horizon, SHADER_UNIFORM_FLOAT);
     SetShaderValue(m_sceneShader, m_scene.maxSteps, &maxSteps, SHADER_UNIFORM_INT);
     SetShaderValue(m_sceneShader, m_scene.aaSamples, &aaSamples, SHADER_UNIFORM_INT);
     SetShaderValue(m_sceneShader, m_scene.starGain, &starGain, SHADER_UNIFORM_FLOAT);
 
-    bindSampler(m_sceneShader, m_scene.sky, m_sky, 1);
     bindSampler(m_sceneShader, m_scene.noise, m_diskNoise, 2);
 
     rlDisableDepthTest();
@@ -317,9 +320,9 @@ void Renderer::drawScene(const CameraFrame& camera, const SimulationParameters& 
             } else {
                 TraceLog(LOG_WARNING, "SCENE readback failed");
             }
-            TraceLog(LOG_WARNING, "UNIFORMS cam=%d step=%d max=%d aa=%d sky=%d noise=%d gain=%d",
+            TraceLog(LOG_WARNING, "UNIFORMS cam=%d step=%d max=%d aa=%d noise=%d gain=%d",
                      m_scene.camPos, m_scene.stepSize, m_scene.maxSteps, m_scene.aaSamples,
-                     m_scene.sky, m_scene.noise, m_scene.diskGain);
+                     m_scene.noise, m_scene.diskGain);
         }
     }
 }

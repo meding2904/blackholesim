@@ -21,7 +21,7 @@ constexpr float kSliderTrackOffset = 17.0f;
 constexpr float kPadTop = 18.0f;
 constexpr float kPadBottom = 18.0f;
 constexpr float kHeaderHeight = 76.0f;
-constexpr float kStatusHeight = 141.0f;
+constexpr float kStatusHeight = 192.0f;
 constexpr float kDiskHeight = 172.0f;
 constexpr float kRenderHeight = 142.0f;
 constexpr float kScaleHeight = 112.0f;
@@ -122,11 +122,11 @@ void Ui::draw(SimulationParameters& params, const UiReadout& readout) {
     float y = layout.panel.y + kPadTop;
 
     // ---- header ------------------------------------------------------------
-    text("SCHWARZSCHILD", x, y, 20.0f, kText, 4.2f);
+    text("KERR", x, y, 20.0f, kText, 4.2f);
     y += 27.0f;
     text("GRAVITATIONAL LENSING", x, y, 10.0f, kAccent, 1.8f);
     y += 14.0f;
-    text("REAL-TIME NULL-GEODESIC TRACER", x, y, 10.0f, kTextFaint, 1.2f);
+    text("BOYER-LINDQUIST NULL-GEODESIC TRACER", x, y, 10.0f, kTextFaint, 1.2f);
     y += 25.0f;  // 66 total from the panel top padding
     divider(x, width, y);
     y += 10.0f;
@@ -139,7 +139,7 @@ void Ui::draw(SimulationParameters& params, const UiReadout& readout) {
         y += 17.0f;
     };
 
-    readoutRow("MODEL", "SCHWARZSCHILD", kText);
+    readoutRow("MODEL", "KERR (ROTATING)", kText);
     std::snprintf(buffer, sizeof(buffer), "%.1f r_g", readout.cameraDistance);
     readoutRow("DISTANCE", buffer, kText);
     std::snprintf(buffer, sizeof(buffer), "%.1f deg", readout.inclinationDegrees);
@@ -158,28 +158,6 @@ void Ui::draw(SimulationParameters& params, const UiReadout& readout) {
     y += 12.0f;
     divider(x, width, y);
     y += 10.0f;
-
-    // ---- disk --------------------------------------------------------------
-    sectionTitle("ACCRETION DISK", x, y);
-    y += 24.0f;
-
-    {
-        Rectangle hit = {x, y - 2.0f, width, 24.0f};
-        const bool hovering = CheckCollisionPointRec(mouse, hit);
-        if (hovering) DrawRectangleRounded({x - 6, y - 4, width + 12, 26}, 0.35f, 4, kHover);
-        const Rectangle box = {x, y + 3.0f, 11.0f, 11.0f};
-        if (params.diskVisible) {
-            DrawRectangle(static_cast<int>(box.x), static_cast<int>(box.y),
-                          static_cast<int>(box.width), static_cast<int>(box.height), kAccent);
-        }
-        DrawRectangleLinesEx(box, 1.0f, params.diskVisible ? kAccent : kTextFaint);
-        text("DISK VISIBLE", x + 20.0f, y, 10.0f, params.diskVisible ? kText : kTextDim);
-        textRight(params.diskVisible ? "ON" : "OFF", right, y, 10.0f, kTextFaint);
-        if (hovering && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-            params.diskVisible = !params.diskVisible;
-        }
-        y += 26.0f;
-    }
 
     const auto slider = [&](const char* label, float& value, float minimum, float maximum,
                             const char* format, const char* suffix) {
@@ -217,6 +195,35 @@ void Ui::draw(SimulationParameters& params, const UiReadout& readout) {
                     (active || hovering) ? kAccent : Color{214, 222, 232, 255});
         y += kRowHeight;
     };
+
+    // ---- spin --------------------------------------------------------------
+    slider("SPIN a/M", params.spin, 0.0f, kMaxSpin, "%.3f", nullptr);
+
+    y += 6.0f;
+    divider(x, width, y);
+    y += 10.0f;
+
+    // ---- disk --------------------------------------------------------------
+    sectionTitle("ACCRETION DISK", x, y);
+    y += 24.0f;
+
+    {
+        Rectangle hit = {x, y - 2.0f, width, 24.0f};
+        const bool hovering = CheckCollisionPointRec(mouse, hit);
+        if (hovering) DrawRectangleRounded({x - 6, y - 4, width + 12, 26}, 0.35f, 4, kHover);
+        const Rectangle box = {x, y + 3.0f, 11.0f, 11.0f};
+        if (params.diskVisible) {
+            DrawRectangle(static_cast<int>(box.x), static_cast<int>(box.y),
+                          static_cast<int>(box.width), static_cast<int>(box.height), kAccent);
+        }
+        DrawRectangleLinesEx(box, 1.0f, params.diskVisible ? kAccent : kTextFaint);
+        text("DISK VISIBLE", x + 20.0f, y, 10.0f, params.diskVisible ? kText : kTextDim);
+        textRight(params.diskVisible ? "ON" : "OFF", right, y, 10.0f, kTextFaint);
+        if (hovering && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            params.diskVisible = !params.diskVisible;
+        }
+        y += 26.0f;
+    }
 
     slider("ROTATION SPEED", params.rotationSpeed, 0.0f, 3.0f, "%.2f", "x");
     slider("TEMPERATURE", params.temperature, 3000.0f, 20000.0f, "%.0f", " K");
@@ -298,9 +305,13 @@ void Ui::draw(SimulationParameters& params, const UiReadout& readout) {
             textRight(value, right, y, 10.0f, kTextFaint);
             y += 17.0f;
         };
-        legendRow({120, 130, 142, 255}, "EVENT HORIZON", "2 r_g");
-        legendRow({150, 208, 255, 255}, "PHOTON SPHERE", "3 r_g");
-        legendRow(kAccent, "INNERMOST ORBIT", "6 r_g");
+        // Every radius is spin dependent for a Kerr hole.
+        std::snprintf(buffer, sizeof(buffer), "%.2f r_g", params.horizonRadius());
+        legendRow({120, 130, 142, 255}, "EVENT HORIZON", buffer);
+        std::snprintf(buffer, sizeof(buffer), "%.2f r_g", params.photonOrbitRadius());
+        legendRow({150, 208, 255, 255}, "PHOTON ORBIT", buffer);
+        std::snprintf(buffer, sizeof(buffer), "%.2f r_g", params.iscoRadius());
+        legendRow(kAccent, "INNERMOST ORBIT", buffer);
     }
 
     // ---- control guide -----------------------------------------------------

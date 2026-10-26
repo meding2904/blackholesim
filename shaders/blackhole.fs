@@ -1,29 +1,18 @@
 #version 330
 
 // ===========================================================================
-//  Schwarzschild black hole: per-pixel backward ray tracing of null geodesics
+//  Kerr black hole: per-pixel backward ray tracing of null geodesics
 //
 //  Units: G = c = 1, distances in gravitational radii r_g = GM/c^2 (M = 1).
-//      event horizon  r = 2      photon sphere  r = 3      ISCO  r = 6
-//      critical impact parameter b = 3*sqrt(3) ~ 5.196
+//      a = 0: horizon 2, photon sphere 3, ISCO 6, b_crit = 3 sqrt(3)
 //
-//  Each camera ray lies in a plane through the hole. In that plane, with
-//  u = r_g / r and phi measured from the camera's radial direction, photons obey
-//
-//      d^2u/dphi^2 + u = 3 u^2                                        (Binet)
-//
-//  which is integrated here with classical RK4 at a fixed dphi (bounded by
-//  uMaxSteps). Initial conditions come from the camera ray's direction cosine
-//  relative to the outward radial:
-//
-//      b    = r0 sin(psi) / sqrt(1 - 2 r_g/r0)      (impact parameter)
-//      du   = -cos(psi) / b                          (radial derivative)
-//
-//  The first integral du^2 = 1/b^2 - u^2 + 2u^3 holds by construction.
-//  Captured rays (u > 1/2) render black; escaping rays sample the procedural
-//  sky along their asymptotic direction. The accretion disk is sampled as a
-//  finite-thickness emissive/absorbing medium each time the ray passes through
-//  the equatorial slab, so multiple lensed images accumulate naturally.
+//  Geodesics are integrated from the Carter-separated first-order system in
+//  Boyer-Lindquist coordinates (see the Kerr geometry section below), which
+//  reduces exactly to the planar Binet equation d^2u/dphi^2 + u = 3u^2 as a -> 0.
+//  Captured rays render black; escaping rays sample the star field along their
+//  asymptotic direction. The accretion disk is sampled as a finite-thickness
+//  emissive/absorbing slab each time the ray passes through the equatorial
+//  plane, so multiple lensed images accumulate naturally.
 // ===========================================================================
 
 in vec2 fragTexCoord;
@@ -44,16 +33,16 @@ uniform float uRotationSpeed; // animation rate multiplier
 uniform float uTempScale;     // Kelvin at the temperature profile peak
 uniform float uDiskGain;      // emission normalisation
 uniform float uDiskDensity;   // optical depth scale
-uniform float uStepSize;      // dphi per RK4 step (radians)
+uniform float uStepSize;      // relative affine step h: dl = h * r
+uniform float uSpin;          // dimensionless spin a/M
+uniform float uHorizon;       // r+ = 1 + sqrt(1 - a^2)
 uniform int   uMaxSteps;
 uniform int   uAASamples;
 uniform float uStarGain;
-uniform sampler2D uSky;       // equirectangular procedural star field
 uniform sampler2D uNoise;     // tileable procedural turbulence
 
 const float PI = 3.14159265359;
 const float ESCAPE_RADIUS = 900.0;
-const vec3  DISK_AXIS = vec3(0.0, 1.0, 0.0);
 
 // ---------------------------------------------------------------------------
 //  Utility
@@ -84,12 +73,63 @@ vec3 blackbodyRGB(float kelvin) {
     return vec3(r, g, b) / 255.0;
 }
 
-vec3 sampleSky(vec3 dir) {
-    float u = atan(dir.z, dir.x) * (0.5 / PI) + 0.5;
-    float v = acos(clamp(dir.y, -1.0, 1.0)) * (1.0 / PI);
-    // Explicit LOD: the illumination loop has data-dependent exits, where
-    // implicit derivatives (and therefore texture() LOD selection) are undefined.
-    return textureLod(uSky, vec2(u, v), 0.0).rgb * uStarGain;
+// ---------------------------------------------------------------------------
+//  Sky: deterministic star field, reconstructed analytically
+//
+//  A star is a point source, which a texture cannot represent through this
+//  pipeline: one screen pixel already covers less sky than a texel of a
+//  4096-wide map, so stars quantise into hard squares, and the 10-100x
+//  magnification near the shadow inflates a single texel into a block that
+//  smears into a streak. Stars therefore live in a spherical cell lattice and
+//  are drawn as Gaussians one screen pixel wide, which keeps them the same size
+//  at any magnification and moves them continuously as the camera moves.
+// ---------------------------------------------------------------------------
+// 0..1 from a lattice cell id (photometry: magnitude and colour).
+float hashCell(vec3 p) {
+    return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+}
+
+vec4 hashCell4(vec3 p) {
+    vec4 q = vec4(p, 1.0);
+    q = fract(q * vec4(0.1031, 0.1030, 0.0973, 0.1099));
+    q += dot(q, q.wzyx + 33.33);
+    return fract((q.xxyz + q.yzzw) * q.zywx);
+}
+
+vec3 sampleSky(vec3 dir, float pixelAngle, float wind) {
+    // 0.018 rad cells: ~19k cells where the unit sphere crosses the lattice.
+    const float CELL = 0.018;
+    // Winding tracks how close the ray came to the critical curve. There the sky
+    // image is folded, so one pixel covers a long strip of sky and a single
+    // point sample of it picks an arbitrary star: the ring speckles into
+    // confetti. Widening the star profile by the same factor spreads that flux
+    // back out, which is what the fold does to the image anyway.
+    float spread = 1.0 + 0.9 * max(wind - 2.0, 0.0);
+    float sigma = 0.70 * pixelAngle * spread;
+    float inv2s2 = 1.0 / (2.0 * sigma * sigma);
+    float cutoff = 9.0 * sigma * sigma;
+    float flux = 1.0 / (spread * spread);   // widening must not add light
+
+    vec3 base = floor(dir / CELL);
+    vec3 sum = vec3(0.0);
+    for (int i = -1; i <= 1; ++i)
+    for (int j = -1; j <= 1; ++j)
+    for (int k = -1; k <= 1; ++k) {
+        vec3 id = base + vec3(float(i), float(j), float(k));
+        vec4 h = hashCell4(id);
+        if (h.w > 0.10) continue;                 // most cells are empty sky
+        vec3 star = normalize(id + h.xyz);
+        float sep2 = max(2.0 - 2.0 * dot(dir, star), 0.0);   // ~angle^2
+        if (sep2 > cutoff) continue;
+
+        float phot = hashCell(id);
+        float mag = pow(phot, 5.0);               // a few bright, many faint
+        float kelvin = 4200.0 + 12500.0 * pow(fract(phot * 37.0), 0.9);
+        vec3 tint = blackbodyRGB(kelvin);
+        tint /= max(max(tint.r, tint.g), max(tint.b, 0.001));
+        sum += tint * (exp(-sep2 * inv2s2) * (0.010 + 0.55 * mag) * flux);
+    }
+    return sum * uStarGain;
 }
 
 // ---------------------------------------------------------------------------
@@ -125,11 +165,15 @@ float diskTurbulence(float r, float theta, float footprint) {
     vec2 p = vec2(cos(a), sin(a)) * r;
 
     // The turbulence texture is 512^2, so each layer has
-    // 512 * scale texels per r_g.
+    // 512 * scale texels per r_g. A bias of one level is deliberate: a mip
+    // chosen so the footprint is exactly one texel still leaves detail at the
+    // Nyquist limit, which reads as per-pixel grain and seethes once the pattern
+    // is advected. One extra level costs nothing visible and removes the churn.
     const float size = 512.0;
-    float lod1 = max(log2(max(footprint * 0.090 * size, 1.0)), 0.0);
-    float lod2 = max(log2(max(footprint * 0.240 * size, 1.0)), 0.0);
-    float lod3 = max(log2(max(footprint * 0.620 * size, 1.0)), 0.0);
+    const float lodBias = 1.0;
+    float lod1 = max(log2(max(footprint * 0.090 * size, 1.0)) + lodBias, 0.0);
+    float lod2 = max(log2(max(footprint * 0.240 * size, 1.0)) + lodBias, 0.0);
+    float lod3 = max(log2(max(footprint * 0.620 * size, 1.0)) + lodBias, 0.0);
 
     float n1 = textureLod(uNoise, p * 0.090 + vec2(0.11, 0.53), lod1).r;
     float n2 = textureLod(uNoise, p * 0.240 + vec2(0.37, 0.23), lod2).g;
@@ -140,59 +184,179 @@ float diskTurbulence(float r, float theta, float footprint) {
     return n * n * (3.0 - 2.0 * n);
 }
 
-// Doppler + gravitational shift for emission from a circular orbit:
-//     g = nu_obs / nu_emit = sqrt(1 - 3M/r) / (1 - Omega * L_phi/E)
-// The numerator carries gravitational and transverse-Doppler redshift, the
-// denominator the line-of-sight motion. bPhi is the conserved L_phi/E of the
-// traced ray (the sign is unchanged for the physical, time-forward photon).
-float frequencyShift(float r, float bPhi) {
-    float u = 1.0 / max(r, 1e-3);
-    float omega = pow(u, 1.5);                 // Keplerian, M = 1
-    float numerator = sqrt(max(1.0 - 3.0 * u, 0.02));
-    float denominator = max(1.0 - omega * bPhi, 0.10);
-    return numerator / denominator;
+// ---------------------------------------------------------------------------
+//  Kerr geometry (M = 1, r_g = 1). Boyer-Lindquist with the spin axis on +Y.
+//
+//  Rays are not planar once a != 0, so instead of one Binet equation the motion
+//  is integrated from the Carter-separated first-order system:
+//      Sigma dr/dl   = sr sqrt(R(r))
+//      Sigma dth/dl  = sc sqrt(Theta(theta))
+//      Sigma dphi/dl = [2 a r E + L (Sigma - 2r)/sin^2(theta)] / Delta
+//  with E, L and the Carter constant Q exact for each ray. The polar state is
+//  the unit pair (cos theta, sin theta), advanced by the exact identities
+//  d(cs, sn)/dl = dth/dl * (-sn, cs): no transcendentals in the loop, one
+//  inverse square root per step to renormalise, and -- unlike a u = cos(theta)
+//  state -- full relative precision in sin^2(theta) near the pole, where the
+//  L/sin^2(theta) spike in dphi/dl carries the entire ~pi sweep of a near-axis
+//  ray. In float32, u = cos(theta) cannot even resolve that region: sin^2 falls
+//  below the ulp of u near 1 and the sweep integrates as noise (the torn seam
+//  and shimmer along the projected spin axis).
+// ---------------------------------------------------------------------------
+float kerrSigma(float r, float cu, float a) { return r * r + a * a * cu * cu; }
+float kerrDelta(float r, float a) { return r * r - 2.0 * r + a * a; }
+
+// Ray constants of the two potentials. They depend only on (E, L, Q, a), so the
+// inner loop evaluates them once per ray instead of once per RK4 stage.
+struct KerrConst {
+    float a2;   // a^2
+    float ea;   // a*E
+    float carter;  // (L - aE)^2 + Q
+    float a2E2;    // a^2 E^2
+    float l2;      // L^2
+};
+
+KerrConst kerrConstants(float E, float L, float Q, float a) {
+    KerrConst c;
+    c.a2 = a * a;
+    c.ea = a * E;
+    c.carter = (L - a * E) * (L - a * E) + Q;
+    c.a2E2 = c.a2 * E * E;
+    c.l2 = L * L;
+    return c;
 }
 
-// Analytic crossing of the equatorial plane. The disk is modelled as a thin
-// optically thick slab: the crossing gives a crisp surface, while the slab
-// thickness divided by the ray's incidence cosine sets the optical depth (so
-// grazing rays see a much longer column and the disk becomes opaque edge-on).
-void accumulateDisk(inout vec3 accum, inout float transmittance, vec3 p0, vec3 p1, float bPhi) {
-    if ((p0.y > 0.0) == (p1.y > 0.0)) return;   // no equatorial crossing in this step
+// Radial centrifugal barrier: R(r) >= 0 is required for the ray to exist.
+float kerrRadial(KerrConst c, float E, float L, float r) {
+    float tr = E * (r * r + c.a2) - c.ea;
+    float dl = r * r - 2.0 * r + c.a2;
+    return tr * tr - dl * c.carter;
+}
 
-    vec3 hit = mix(p0, p1, p0.y / (p0.y - p1.y));
-    float r = length(hit);
-    if (r <= uDiskInner || r >= uDiskOuter) return;
+// (Sigma dtheta/dl)^2 = Theta(theta) = Q + a^2 E^2 cos^2 - L^2 cos^2/sin^2.
+// Negative inside the polar forbidden zone |theta| < thetaT, where the ray has
+// reached its turning point and must bounce.
+float kerrPolarTheta(KerrConst c, float Q, float cu, float sn) {
+    float s2 = max(sn * sn, 1.0e-20);
+    float u2 = cu * cu;
+    return Q + c.a2E2 * u2 - c.l2 * u2 / s2;
+}
 
-    vec3 dir = normalize(p1 - p0);
-    float incidence = max(abs(dir.y), 0.02);
+// Polar turning point. A ray with L != 0 bounces at |theta| = thetaT and can
+// never enter the zone below it. sin^2(thetaT) is the small positive root of
+// Theta = 0 in a cancellation-free form that keeps full float32 precision for
+// tiny thetaT:
+//   sin^2(thetaT) = 2 L^2 / (a^2 E^2 + Q + L^2 + sqrt(B^2 + 4 a^2 E^2 Q)),
+//   B = a^2 E^2 - Q - L^2.
+// The mirror through the turning point is the double-angle reflection
+// theta -> 2 thetaT - theta (north) or 2 (pi - thetaT) - theta (south),
+// expressed on (cos, sin) with C2 = cos(2 thetaT), S2 = sin(2 thetaT).
+void kerrPolarTurn(float E, float L, float Q, float a, out float snT, out float C2,
+                   out float S2) {
+    float A = a * a * E * E;
+    float B = A - Q - L * L;
+    float s = 2.0 * L * L /
+              max(A + Q + L * L + sqrt(max(B * B + 4.0 * A * Q, 0.0)), 1.0e-20);
+    s = clamp(s, 0.0, 1.0);
+    snT = sqrt(s);
+    C2 = 1.0 - 2.0 * s;
+    S2 = 2.0 * snT * sqrt(max(1.0 - s, 0.0));
+}
+
+void kerrDeriv(float r, float cu, float sn, KerrConst kc, float E, float L, float Q, float a,
+               float sr, float sc, out float dr, out float dth, out float dph) {
+    float sigma = kerrSigma(r, cu, a);
+    float delta = kerrDelta(r, a);
+    float R = max(kerrRadial(kc, E, L, r), 0.0);
+    float T = max(kerrPolarTheta(kc, Q, cu, sn), 0.0);
+    float sin2 = max(sn * sn, 1.0e-20);
+    dr = sr * sqrt(R) / sigma;
+    dth = sc * sqrt(T) / sigma;
+    dph = (2.0 * a * r * E + L * (sigma - 2.0 * r) / sin2) / (sigma * delta);
+}
+
+// Camera ray -> conserved (E, L, Q). The camera is a static observer: its
+// orthonormal frame gives k = e_t + n_r e_r + n_theta e_theta + n_phi e_phi,
+// which is the a = 0 construction generalised to Kerr.
+void kerrRayInit(vec3 pos, vec3 dir, float a, out float r, out float cu, out float sn,
+                 out float ph, out float E, out float L, out float Q, out float sr,
+                 out float sc) {
+    r = length(pos);
+    cu = clamp(pos.y / max(r, 1.0e-4), -1.0, 1.0);
+    float sinT = sqrt(max(1.0 - cu * cu, 1.0e-8));
+    sn = sinT;
+    ph = atan(pos.z, pos.x);
+    float cp = cos(ph);
+    float sp = sin(ph);
+    vec3 rhat = vec3(sinT * cp, cu, sinT * sp);
+    vec3 that = vec3(cu * cp, -sinT, cu * sp);
+    vec3 phat = vec3(-sp, 0.0, cp);
+    float nr = dot(dir, rhat);
+    float nt = dot(dir, that);
+    float np = dot(dir, phat);
+
+    float sigma = r * r + a * a * cu * cu;
+    float delta = r * r - 2.0 * r + a * a;
+    float sin2 = max(sinT * sinT, 1.0e-6);
+    float gtt = -(1.0 - 2.0 * r / sigma);
+    float gtphi = -2.0 * a * r * sin2 / sigma;
+    float gphiphi = (r * r + a * a + 2.0 * a * a * r * sin2 / sigma) * sin2;
+    float beta = inversesqrt(max(gphiphi - gtphi * gtphi / gtt, 1.0e-9));
+    float alphaT = -(gtphi / gtt) * beta;
+
+    float kt = inversesqrt(max(-gtt, 1.0e-6)) + np * alphaT;
+    float kr = nr * sqrt(max(delta / sigma, 0.0));
+    float kth = nt * inversesqrt(max(sigma, 1.0e-6));
+    float kphi = np * beta;
+
+    E = -(gtt * kt + gtphi * kphi);
+    L = gtphi * kt + gphiphi * kphi;
+    float pth = sigma * kth;
+    Q = pth * pth + cu * cu * (L * L / sin2 - a * a * E * E);
+    sr = (kr >= 0.0) ? 1.0 : -1.0;
+    sc = (kth >= 0.0) ? 1.0 : -1.0;      // sign of dtheta/dl
+}
+
+// Emission shift from a circular prograde equatorial orbit:
+//     g = 1 / (u^t (1 - Omega L/E)),  Omega = 1/(r^{3/2} + a)
+//     u^t = (r^{3/2} + a) / (r^{3/4} sqrt(r^{3/2} - 3 r^{1/2} + 2a))
+// The square root carries the gravitational and transverse Doppler redshift of
+// the orbit, the denominator the line-of-sight Doppler boost.
+float kerrOrbitShift(float r, float a, float lOverE) {
+    float sq = sqrt(max(r, 1.0e-3));
+    float omega = 1.0 / (r * sq + a);
+    float ut = (r * sq + a) /
+               (pow(max(r, 1.0e-3), 0.75) * sqrt(max(r * sq - 3.0 * sq + 2.0 * a, 1.0e-4)));
+    return 1.0 / (ut * max(1.0 - omega * lOverE, 0.05));
+}
+
+// Emissive shading for one hit on the disk: either the equatorial sheet (the
+// normal case) or the inner rim wall, which faces the hole radially.
+void shadeDiskPoint(inout vec3 accum, inout float transmittance, float r, float phi,
+                    float incidence, float edgeInner, KerrConst kc, float E, float L, float Q,
+                    float a) {
     float column = clamp(2.0 * diskHalfThickness(r) / incidence, 0.0, 24.0);
 
-    float edgeIn = smoothstep(uDiskInner, uDiskInner * 1.18, r);
+    float edgeIn = edgeInner * smoothstep(uDiskInner, uDiskInner * 1.18, r);
     float edgeOut = 1.0 - smoothstep(uDiskOuter * 0.58, uDiskOuter, r);
-    float theta = atan(hit.z, hit.x);
     // Screen footprint: distance x angular pixel size, stretched by the
     // incidence angle so grazing views do not alias.
-    float footprint = length(hit - uCamPos) * (2.0 * uTanHalfFov / uResolution.y) / incidence;
-    float turb = diskTurbulence(r, theta, footprint);
+    float hitDistance = length(vec3(r * cos(phi), 0.0, r * sin(phi)) - uCamPos);
+    float footprint = hitDistance * (2.0 * uTanHalfFov / uResolution.y) / incidence;
+    float turb = diskTurbulence(r, phi, footprint);
 
     float density = edgeIn * edgeOut * (0.14 + 1.05 * turb);
-    float tau = uDiskDensity * density * column;
-    float alpha = 1.0 - exp(-tau);
+    float alpha = 1.0 - exp(-uDiskDensity * density * column);
 
-    // The Shakura-Sunyaev profile vanishes at the inner edge (zero torque);
-    // soften it so the rim glows instead of cutting to black.
     float tNorm = mix(0.78, temperatureNorm(r), smoothstep(uDiskInner, uDiskInner * 1.45, r)) *
                   (0.90 + 0.20 * turb);
-    float g = frequencyShift(r, bPhi);
+    // The shift is unbounded on paper for a ray emitted exactly along the
+    // orbital motion; a thin, non-limb-darkened disk cannot resolve that, so the
+    // displayed range is bounded (documented approximation).
+    float g = clamp(kerrOrbitShift(r, a, -L / max(E, 1.0e-4)), 0.08, 5.0);
 
-    // blackbodyRGB returns display-referred sRGB; convert to linear so the
-    // tone mapper does not wash the warm colours out.
     vec3 tint = pow(blackbodyRGB(tNorm * uTempScale * g), vec3(2.2));
     tint = mix(vec3(dot(tint, vec3(0.2126, 0.7152, 0.0722))), tint, 1.25);
 
-    // Bolometric surface brightness: sigma T^4 falls off steeply, softened here
-    // so the outer disk stays readable, plus the g^4 beaming factor.
     float brightness = uDiskGain * pow(tNorm, 3.4) * pow(g, 4.0);
     brightness *= 0.30 + 0.95 * turb;
     brightness *= 1.0 + 1.40 * exp(-(r - uDiskInner) * 0.50);   // hot inner rim
@@ -201,9 +365,73 @@ void accumulateDisk(inout vec3 accum, inout float transmittance, vec3 p0, vec3 p
     transmittance *= (1.0 - alpha);
 }
 
+// Equatorial crossing, found with a cubic Hermite root of cos(theta) inside the
+// step. A linear root is off by O(dl^2) with dl of a few r_g, which walks the hit
+// radius by a visible fraction of r_g from pixel to pixel.
+void accumulateDisk(inout vec3 accum, inout float transmittance, float r0, float cu0,
+                    float sn0, float ph0, float r1, float cu1, float sn1, float ph1, float dl,
+                    KerrConst kc, float E, float L, float Q, float a) {
+    float drA, dthA, dpA, drB, dthB, dpB;
+    kerrDeriv(r0, cu0, sn0, kc, E, L, Q, a, 1.0, 1.0, drA, dthA, dpA);
+    kerrDeriv(r1, cu1, sn1, kc, E, L, Q, a, 1.0, 1.0, drB, dthB, dpB);
+    float mu0 = -sn0 * dthA * dl, mu1 = -sn1 * dthB * dl;   // d(cos)/dl * dl
+    float mr0 = drA * dl, mr1 = drB * dl;
+    float s = clamp(cu0 / (cu0 - cu1), 0.0, 1.0);
+    for (int it = 0; it < 3; ++it) {
+        float s2 = s * s, s3 = s2 * s;
+        float cuS = (2.0 * s3 - 3.0 * s2 + 1.0) * cu0 + (s3 - 2.0 * s2 + s) * mu0 +
+                    (-2.0 * s3 + 3.0 * s2) * cu1 + (s3 - s2) * mu1;
+        float dcuS = (6.0 * s2 - 6.0 * s) * cu0 + (3.0 * s2 - 4.0 * s + 1.0) * mu0 +
+                     (-6.0 * s2 + 6.0 * s) * cu1 + (3.0 * s2 - 2.0 * s) * mu1;
+        if (abs(dcuS) < 1.0e-9) break;
+        s = clamp(s - cuS / dcuS, 0.0, 1.0);
+    }
+    float s2 = s * s, s3 = s2 * s;
+    float r = (2.0 * s3 - 3.0 * s2 + 1.0) * r0 + (s3 - 2.0 * s2 + s) * mr0 +
+              (-2.0 * s3 + 3.0 * s2) * r1 + (s3 - s2) * mr1;
+    if (r <= uDiskInner || r >= uDiskOuter) return;
+
+    float dphi = mod(ph1 - ph0 + PI, 2.0 * PI) - PI;   // shortest way round
+    float phi = ph0 + dphi * s;
+
+    // Incidence: the disk normal is +Y = cos(theta) rhat - sin(theta) thetahat,
+    // so on the equator |cos i| = |v_theta| / |v|.
+    float dr, dth, dph;
+    kerrDeriv(r, 0.0, 1.0, kc, E, L, Q, a, 1.0, 1.0, dr, dth, dph);
+    float vTheta = r * dth;                      // sin(theta) = 1 here
+    float vPhi = r * dph;
+    float speed = sqrt(dr * dr + vTheta * vTheta + vPhi * vPhi);
+    float incidence = clamp(abs(vTheta) / max(speed, 1.0e-6), 0.02, 1.0);
+
+    shadeDiskPoint(accum, transmittance, r, phi, incidence, 1.0, kc, E, L, Q, a);
+}
+
+// Inner rim wall. The disk is a thin slab with a vertical edge at the ISCO, so a
+// sightline that grazes the equatorial plane *inside* that radius meets the wall
+// rather than passing through a hole. Without this the edge-on view shows a dark
+// filament wherever the first crossing falls inside the disk.
+void accumulateRim(inout vec3 accum, inout float transmittance, float r0, float ph0, float r1,
+                   float ph1, float cu, KerrConst kc, float E, float L, float Q, float a) {
+    float slab = diskHalfThickness(uDiskInner) / max(uDiskInner, 1.0);
+    if (abs(cu) > 3.0 * slab) return;   // above the rim height: it passes overhead
+
+    float dphi = mod(ph1 - ph0 + PI, 2.0 * PI) - PI;
+    float frac = clamp((uDiskInner - r0) / max(r1 - r0, 1.0e-6), 0.0, 1.0);
+    float phi = ph0 + dphi * frac;
+
+    float dr, dth, dph;
+    kerrDeriv(uDiskInner, 0.0, 1.0, kc, E, L, Q, a, 1.0, 1.0, dr, dth, dph);
+    float speed = sqrt(dr * dr + (uDiskInner * dph) * (uDiskInner * dph));
+    // The wall faces radially, so its incidence is the radial velocity share.
+    float incidence = clamp(abs(dr) / max(speed, 1.0e-6), 0.08, 1.0);
+    shadeDiskPoint(accum, transmittance, uDiskInner * 1.12, phi, incidence, 1.0, kc, E, L, Q, a);
+}
+
 // ---------------------------------------------------------------------------
 //  Ray setup
 // ---------------------------------------------------------------------------
+// Sample offsets relative to the pixel centre. Nested, so that refining a pixel
+// from one sample to four keeps the first sample where it was.
 vec2 aaOffset(int index, int count) {
     if (count >= 4) {
         return vec2(((index == 0 || index == 3) ? -0.25 : 0.25),
@@ -212,96 +440,156 @@ vec2 aaOffset(int index, int count) {
     if (count == 2) {
         return (index == 0) ? vec2(-0.25, -0.25) : vec2(0.25, 0.25);
     }
-    return vec2(0.0);
+    return vec2(-0.25);
 }
 
-vec3 traceCameraRay(vec3 origin, vec3 dir) {
-    float r0 = length(origin);
-    vec3 e1 = origin / r0;                     // outward radial basis
-    float u0 = 1.0 / r0;
-    float cosPsi = dot(dir, e1);
-    vec3 tangential = dir - e1 * cosPsi;
-    float sinPsi = length(tangential);
+vec3 rayDirection(vec2 pixel) {
+    vec2 ndc = (pixel - 0.5 * uResolution) / (0.5 * uResolution.y);
+    return normalize(uCamForward + uCamRight * (ndc.x * uTanHalfFov) +
+                     uCamUp * (ndc.y * uTanHalfFov));
+}
 
-    // Purely radial rays carry no angular momentum: straight in or straight out.
-    if (sinPsi < 1.0e-5) {
-        return (cosPsi < 0.0) ? vec3(0.0) : sampleSky(dir);
-    }
-
-    vec3 e2 = tangential / sinPsi;                       // +phi direction
-    vec3 planeNormal = normalize(cross(e1, e2));         // orbital normal
-    float bPhi = 0.0;                                     // filled below
-
-    float lapse = sqrt(max(1.0 - 2.0 * u0, 1.0e-4));
-    float b = r0 * sinPsi / lapse;
-    bPhi = b * dot(planeNormal, DISK_AXIS);
-
-    float u = u0;
-    float du = -cosPsi / b;
-
-    vec3 radial = e1;
-    vec3 position = origin;
-
-    // Rotation by one fixed phase step, about the orbital normal.
-    float cs = cos(uStepSize);
-    float sn = sin(uStepSize);
+// wind: total azimuth swept, which is small for a ray that goes straight to the
+// background or to the near side of the disk, and large once it wraps the hole.
+vec3 traceCameraRay(vec3 origin, vec3 dir, out float wind) {
+    float r, cu, sn, phi, E, L, Q, sr, sc;
+    kerrRayInit(origin, dir, uSpin, r, cu, sn, phi, E, L, Q, sr, sc);
+    float phiStart = phi;
+    // Polar turning point, a ray constant. snT = 0 exactly for L = 0, whose
+    // geodesic crosses the axis instead of bouncing; that case must skip the
+    // pole-proximity ruler below or it would stall at the axis.
+    float snT, C2, S2;
+    kerrPolarTurn(E, L, Q, uSpin, snT, C2, S2);
+    bool polarGuard = snT > 1.0e-6;
+    KerrConst kc = kerrConstants(E, L, Q, uSpin);
 
     vec3 accum = vec3(0.0);
     float transmittance = 1.0;
     vec3 escapeDir = dir;
+    bool escaped = false;
 
     for (int i = 0; i < uMaxSteps; ++i) {
-        // ---- RK4 on u'' = 3u^2 - u -------------------------------------
-        float k1u = du;
-        float k1d = 3.0 * u * u - u;
-        float k2u = du + 0.5 * uStepSize * k1d;
-        float u2 = u + 0.5 * uStepSize * k1u;
-        float k2d = 3.0 * u2 * u2 - u2;
-        float k3u = du + 0.5 * uStepSize * k2d;
-        float u3 = u + 0.5 * uStepSize * k2u;
-        float k3d = 3.0 * u3 * u3 - u3;
-        float k4u = du + uStepSize * k3d;
-        float u4 = u + uStepSize * k3u;
-        float k4d = 3.0 * u4 * u4 - u4;
+        // Two step rulers, whichever is stricter: geometric (dl = h r, which
+        // strides through the nearly straight far field and stays finite at a
+        // turning point) and angular (bounded sweep per step, which is what
+        // actually resolves the bending near the hole).
+        // Stage 1 doubles as the step ruler: same point, same derivative.
+        float k1r, k1th, k1p, k2r, k2th, k2p, k3r, k3th, k3p, k4r, k4th, k4p;
+        kerrDeriv(r, cu, sn, kc, E, L, Q, uSpin, sr, sc, k1r, k1th, k1p);
+        float rate = max(abs(k1p), abs(k1th));
+        float dl = uStepSize * max(r, 1.0);
+        if (rate > 1.0e-9) dl = min(dl, uStepSize * 0.6 / rate);
+        // Pole-proximity ruler: keep the theta travel a quarter of the distance
+        // to the pole, so the L/sin^2(theta) spike in dphi cannot change by
+        // orders of magnitude inside one RK4 step. That spike carries the whole
+        // ~pi sweep of a near-axis ray; a step that leaps into it samples it in
+        // one stage only and integrates it as garbage (star confetti along the
+        // seam). Inside the spike the angular ruler above takes over.
+        if (polarGuard && abs(k1th) > 1.0e-9) dl = min(dl, 0.25 * sn / abs(k1th));
 
-        float un = u + (uStepSize / 6.0) * (k1u + 2.0 * k2u + 2.0 * k3u + k4u);
-        float dun = du + (uStepSize / 6.0) * (k1d + 2.0 * k2d + 2.0 * k3d + k4d);
+        // RK4 on (r, cos theta, sin theta, phi). The polar pair advances by the
+        // exact identity d(cs, sn)/dl = dth/dl * (-sn, cs).
+        float k1cs = -sn * k1th, k1sn = cu * k1th;
+        float cs2 = cu + 0.5 * dl * k1cs, sn2 = sn + 0.5 * dl * k1sn;
+        kerrDeriv(r + 0.5 * dl * k1r, cs2, sn2, kc, E, L, Q, uSpin, sr, sc, k2r, k2th, k2p);
+        float k2cs = -sn2 * k2th, k2sn = cs2 * k2th;
+        float cs3 = cu + 0.5 * dl * k2cs, sn3 = sn + 0.5 * dl * k2sn;
+        kerrDeriv(r + 0.5 * dl * k2r, cs3, sn3, kc, E, L, Q, uSpin, sr, sc, k3r, k3th, k3p);
+        float k3cs = -sn3 * k3th, k3sn = cs3 * k3th;
+        float cs4 = cu + dl * k3cs, sn4 = sn + dl * k3sn;
+        kerrDeriv(r + dl * k3r, cs4, sn4, kc, E, L, Q, uSpin, sr, sc, k4r, k4th, k4p);
+        float k4cs = -sn4 * k4th, k4sn = cs4 * k4th;
 
-        // ---- advance the 3D position ------------------------------------
-        vec3 nextRadial = radial * cs + cross(planeNormal, radial) * sn;
-        vec3 nextPosition = nextRadial * (1.0 / un);
+        float rn = r + (dl / 6.0) * (k1r + 2.0 * k2r + 2.0 * k3r + k4r);
+        float cn = cu + (dl / 6.0) * (k1cs + 2.0 * k2cs + 2.0 * k3cs + k4cs);
+        float snn = sn + (dl / 6.0) * (k1sn + 2.0 * k2sn + 2.0 * k3sn + k4sn);
+        float pn = phi + (dl / 6.0) * (k1p + 2.0 * k2p + 2.0 * k3p + k4p);
 
-        // ---- event horizon ----------------------------------------------
-        if (un > 0.5) {                       // r < 2 r_g: captured
+        // Disk crossing, tested on the raw step end before any mirror: a
+        // grazing ray that overshoots the lower polar turning point would
+        // otherwise be reflected back to the positive side and lose its hit.
+        bool crossed = (cu > 0.0) != (cn > 0.0);
+        if (uDiskVisible > 0.5 && transmittance > 0.002) {
+            if (crossed) {
+                accumulateDisk(accum, transmittance, r, cu, sn, phi, rn, cn, snn, pn, dl, kc,
+                               E, L, Q, uSpin);
+            } else if ((r < uDiskInner) != (rn < uDiskInner)) {
+                accumulateRim(accum, transmittance, r, phi, rn, pn, cu, kc, E, L, Q, uSpin);
+            }
+        }
+
+        // Turning points: mirror through the root and flip the branch. R depends
+        // only on r and Theta only on cos(theta), so each test is independent.
+        if (kerrRadial(kc, E, L, rn) < 0.0) {
+            // Newton on R(r) = 0 so the mirror is about the turning radius itself.
+            float rt = 0.5 * (r + rn);
+            float slope = 4.0 * E * rt * (E * (rt * rt + kc.a2) - kc.ea) -
+                          (2.0 * rt - 2.0) * kc.carter;
+            if (abs(slope) > 1.0e-9) {
+                rt = clamp(rt - kerrRadial(kc, E, L, rt) / slope, min(r, rn), max(r, rn));
+            }
+            rn = 2.0 * rt - rn;
+            sr = -sr;
+        }
+        if (kerrPolarTheta(kc, Q, cn, snn) < 0.0) {
+            // Mirror through the polar turning point (the double-angle
+            // reflection on the unit pair) and flip the branch. L = 0 keeps
+            // Theta > 0 and never enters this branch: that ray crosses the axis
+            // freely, which is its correct continuation.
+            float cn0 = cn;
+            if (cn >= 0.0) {
+                cn = C2 * cn + S2 * snn;
+                snn = S2 * cn0 - C2 * snn;
+            } else {
+                cn = C2 * cn - S2 * snn;
+                snn = -S2 * cn0 - C2 * snn;
+            }
+            sc = -sc;
+        }
+        float nrm = inversesqrt(max(cn * cn + snn * snn, 1.0e-12));
+        cn *= nrm;
+        snn *= nrm;
+
+        r = rn;
+        cu = cn;
+        sn = snn;
+        phi = pn;
+
+        // Event horizon: Delta < 0 is exactly the region between the horizons.
+        if (r <= uHorizon || kerrDelta(r, uSpin) <= 0.0) {
             transmittance = 0.0;
             break;
         }
-        if (un <= 0.0) {                      // radial escape overshot infinity
-            escapeDir = nextRadial;
-            break;
-        }
 
-        // ---- accretion disk ---------------------------------------------
-        if (uDiskVisible > 0.5 && transmittance > 0.002) {
-            accumulateDisk(accum, transmittance, position, nextPosition, bPhi);
-        }
-
-        u = un;
-        du = dun;
-        radial = nextRadial;
-        position = nextPosition;
-
-        // ---- escape to the background -----------------------------------
-        if (un <= 1.0 / ESCAPE_RADIUS && dun < 0.0) {
-            // cos(psi) = -b du, sin(psi) = b u sqrt(1 - 2u); normalising the
-            // result removes the coordinate-frame scaling.
-            escapeDir = normalize(radial * (-b * du) + e2 * (b * u * sqrt(max(1.0 - 2.0 * u, 0.0))));
-            break;
+        // Escape to the background: far away and moving outward.
+        if (r >= ESCAPE_RADIUS) {
+            float dr, dth, dph;
+            kerrDeriv(r, cu, sn, kc, E, L, Q, uSpin, sr, sc, dr, dth, dph);
+            if (dr > 0.0) {
+                float cp = cos(phi);
+                float sp = sin(phi);
+                vec3 rhat = vec3(sn * cp, cu, sn * sp);
+                vec3 that = vec3(cu * cp, -sn, cu * sp);
+                vec3 phat = vec3(-sp, 0.0, cp);
+                escapeDir = normalize(rhat * dr + that * (r * dth) + phat * (r * sn * dph));
+                escaped = true;
+                break;
+            }
         }
     }
 
+    wind = abs(phi - phiStart);
+
+    // A ray that burns its whole step budget is still winding near the critical
+    // curve: treat it as captured rather than sampling the sky from a direction
+    // it never reached. Without this the shadow edge speckles with stars.
+    if (!escaped) transmittance = 0.0;
+
     vec3 color = accum;
-    if (transmittance > 0.002) color += transmittance * sampleSky(escapeDir);
+    if (transmittance > 0.002) {
+        float pixelAngle = 2.0 * uTanHalfFov / uResolution.y;
+        color += transmittance * sampleSky(escapeDir, pixelAngle, wind);
+    }
     return color;
 }
 
@@ -309,18 +597,31 @@ vec3 traceCameraRay(vec3 origin, vec3 dir) {
 //  Main
 // ---------------------------------------------------------------------------
 void main() {
-    vec3 color = vec3(0.0);
-    int count = max(uAASamples, 1);
+    int count = clamp(uAASamples, 1, 4);
+    vec2 base = gl_FragCoord.xy;
 
-    for (int s = 0; s < 4; ++s) {
-        if (s >= count) break;
-        vec2 pixel = gl_FragCoord.xy + aaOffset(s, count);
-        vec2 ndc = (pixel - 0.5 * uResolution) / (0.5 * uResolution.y);
-        vec3 dir = normalize(uCamForward + uCamRight * (ndc.x * uTanHalfFov) +
-                             uCamUp * (ndc.y * uTanHalfFov));
-        color += traceCameraRay(uCamPos, dir);
+    // Sub-pixel dither. Rays lying exactly in the plane through the hole, the
+    // camera and the spin axis (the centre column) are a symmetry set: with no
+    // angular momentum about the axis they plunge where their neighbours wind,
+    // which leaves a one-pixel seam through the disk. A per-pixel offset breaks
+    // the alignment, so the seam is averaged away instead of being coherent.
+    vec2 dither = vec2(hash12(base), hash12(base + vec2(19.19, 7.77))) - 0.5;
+    vec2 origin = base + dither * 0.7;
+
+    float wind = 0.0;
+    vec3 color = traceCameraRay(uCamPos, rayDirection(origin + aaOffset(0, count)), wind);
+
+    // A ray that has wound half a turn or more returns through a strongly
+    // compressed image: one pixel then spans many r_g of disk, temperature and
+    // Doppler factor included, so a single sample picks one of them and the
+    // result speckles. Refine only those pixels; the rest of the frame does not
+    // need four rays.
+    int total = (wind > 3.0 && count < 4) ? 4 : count;
+    for (int s = 1; s < 4; ++s) {
+        if (s >= total) break;
+        color += traceCameraRay(uCamPos, rayDirection(origin + aaOffset(s, total)), wind);
     }
-    color /= float(count);
+    color /= float(total);
 
     finalColor = vec4(color, 1.0);
 }

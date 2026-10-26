@@ -19,8 +19,10 @@ struct RunOptions {
     float startTime = 0.0f;
     float yaw = 0.70f;
     float pitch = 0.16f;
+    float spin = 0.6f;
     float distance = 45.0f;   // matches CameraController's default view
     int quality = -1;  // -1 keeps the default preset
+    int benchFrames = 0;  // > 0: render this many unthrottled frames, report timings
 };
 
 class Application {

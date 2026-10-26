@@ -1,6 +1,7 @@
 #pragma once
 
 #include "geodesic.hpp"
+#include "kerr.hpp"
 
 namespace bh {
 
@@ -8,7 +9,8 @@ namespace bh {
 // so changing the mass never changes the image. It only changes the physical
 // scale readout (kilometres, seconds), which is what gravitationalRadiusKm()
 // and lightCrossingSeconds() report.
-inline constexpr float kInnerDiskRadius = 6.0f;   // ISCO for Schwarzschild
+inline constexpr float kInnerDiskRadius = 6.0f;   // ISCO for Schwarzschild (a = 0)
+inline constexpr float kMaxSpin = 0.998f;         // Thorne limit
 
 enum class QualityPreset { Performance = 0, Balanced = 1, High = 2 };
 inline constexpr int kQualityCount = 3;
@@ -25,6 +27,7 @@ const QualitySettings& qualitySettings(QualityPreset preset);
 
 struct SimulationParameters {
     bool diskVisible = true;
+    float spin = 0.6f;            // dimensionless a/M, prograde disk
     float rotationSpeed = 1.0f;   // multiples of the Keplerian rate
     float temperature = 6800.0f;  // Kelvin at the peak of the thin-disk profile
     float outerRadius = 26.0f;    // r_g
@@ -36,6 +39,13 @@ struct SimulationParameters {
     float stellarMass = 10.0f;    // solar masses, scale readout only
 
     void clamp();
+
+    // Spin-dependent geometry used by the renderer and the interface.
+    float horizonRadius() const { return static_cast<float>(kerrHorizonRadius(spin)); }
+    float iscoRadius() const { return static_cast<float>(kerrIscoRadius(spin, true)); }
+    float photonOrbitRadius() const {
+        return static_cast<float>(kerrPhotonOrbitRadius(spin, true));
+    }
 };
 
 // Physical scales (cgs/SI converted): r_g = GM/c^2 = 1.4766 km per solar mass.

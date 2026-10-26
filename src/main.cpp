@@ -10,7 +10,7 @@ namespace {
 
 void printUsage() {
     std::printf(
-        "Schwarzschild black hole - real-time gravitational lensing\n"
+        "Kerr black hole - real-time gravitational lensing\n"
         "\n"
         "Usage: blackhole [options]\n"
         "\n"
@@ -20,11 +20,13 @@ void printUsage() {
         "  --distance R       camera distance in r_g (default 45)\n"
         "  --yaw RAD          camera azimuth in radians (default 0.70)\n"
         "  --pitch RAD        camera elevation in radians (default 0.16)\n"
+        "  --spin A           dimensionless spin a/M, 0..0.998 (default 0.6)\n"
         "  --time SECONDS     initial disk animation phase\n"
         "  --paused           start with the disk animation paused\n"
         "  --no-ui            hide the control panel\n"
         "  --capture FILE     render a few frames, save a PNG and exit\n"
         "  --frames N         frames to render before capturing (default 20)\n"
+        "  --bench N          render N frames with vsync off, print frame times, exit\n"
         "  --help             show this text\n"
         "\n"
         "Controls:\n"
@@ -87,6 +89,8 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "Invalid --quality (performance|balanced|high)\n");
                 return 2;
             }
+        } else if (std::strcmp(arg, "--spin") == 0) {
+            options.spin = static_cast<float>(std::atof(next("--spin")));
         } else if (std::strcmp(arg, "--distance") == 0) {
             options.distance = static_cast<float>(std::atof(next("--distance")));
         } else if (std::strcmp(arg, "--yaw") == 0) {
@@ -95,6 +99,10 @@ int main(int argc, char** argv) {
             options.pitch = static_cast<float>(std::atof(next("--pitch")));
         } else if (std::strcmp(arg, "--time") == 0) {
             options.startTime = static_cast<float>(std::atof(next("--time")));
+        } else if (std::strcmp(arg, "--bench") == 0) {
+            options.benchFrames = std::atoi(next("--bench"));
+        } else if (std::strcmp(arg, "--spin") == 0) {
+            options.spin = static_cast<float>(std::atof(next("--spin")));
         } else if (std::strcmp(arg, "--frames") == 0) {
             options.captureFrames = std::atoi(next("--frames"));
         } else if (std::strcmp(arg, "--capture") == 0) {

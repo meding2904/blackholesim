@@ -38,10 +38,11 @@ private:
         int diskGain = -1;
         int diskDensity = -1;
         int stepSize = -1;
+        int spin = -1;
+        int horizon = -1;
         int maxSteps = -1;
         int aaSamples = -1;
         int starGain = -1;
-        int sky = -1;
         int noise = -1;
     };
 
@@ -72,7 +73,6 @@ private:
     int m_compExposure = -1;
     int m_compBloom = -1;
 
-    Texture2D m_sky = {};
     Texture2D m_diskNoise = {};
 
     RenderTexture2D m_sceneTarget = {};

@@ -5,10 +5,11 @@
 namespace bh {
 
 namespace {
+// The step is relative (dl = h r), so it is directly comparable between spins.
 constexpr QualitySettings kQuality[kQualityCount] = {
-    {"Performance", 0.62f, 0.018f, 200, 1},
-    {"Balanced", 0.82f, 0.012f, 320, 1},
-    {"High", 0.88f, 0.008f, 460, 2},
+    {"Performance", 0.62f, 0.055f, 420, 1},
+    {"Balanced", 0.82f, 0.035f, 1200, 1},
+    {"High", 0.88f, 0.022f, 1400, 2},
 };
 }  // namespace
 
@@ -18,9 +19,11 @@ const QualitySettings& qualitySettings(QualityPreset preset) {
 }
 
 void SimulationParameters::clamp() {
+    spin = std::clamp(spin, 0.0f, kMaxSpin);
     rotationSpeed = std::clamp(rotationSpeed, 0.0f, 3.0f);
     temperature = std::clamp(temperature, 3000.0f, 20000.0f);
-    outerRadius = std::clamp(outerRadius, kInnerDiskRadius + 2.0f, 45.0f);
+    // The disk cannot reach inside its own ISCO, which shrinks with spin.
+    outerRadius = std::clamp(outerRadius, iscoRadius() * 1.25f, 45.0f);
     exposure = std::clamp(exposure, 0.1f, 4.0f);
     bloom = std::clamp(bloom, 0.0f, 2.0f);
     stellarMass = std::clamp(stellarMass, 0.1f, 1.0e8f);

@@ -1,9 +1,13 @@
 #include "application.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <vector>
 
+#include "raylib.h"
+#include "raylib.h"
 #include "rlgl.h"
 
 namespace bh {
@@ -15,7 +19,10 @@ constexpr float kDiskTimeScale = 12.0f;
 
 int Application::run(const RunOptions& options) {
     SetTraceLogLevel(LOG_WARNING);
-    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
+    // vsync would cap the benchmark at the display rate, hiding the real cost.
+    const bool benchmark = options.benchFrames > 0;
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE |
+                   (benchmark ? 0 : static_cast<unsigned int>(FLAG_VSYNC_HINT)));
     InitWindow(options.width, options.height,
                "Schwarzschild Black Hole - Gravitational Lensing");
     if (!IsWindowReady()) {
@@ -26,6 +33,7 @@ int Application::run(const RunOptions& options) {
     SetExitKey(KEY_ESCAPE);
     SetTargetFPS(0);  // vsync-limited
 
+    m_params.spin = options.spin;
     m_params.showUi = !options.noUi;
     m_params.paused = options.paused;
     if (options.quality >= 0 && options.quality < kQualityCount) {
@@ -44,8 +52,20 @@ int Application::run(const RunOptions& options) {
 
     m_diskTime = options.startTime;
     int frameIndex = 0;
+    std::vector<double> frameMs;
+    std::chrono::steady_clock::time_point prevStart{};
+    if (benchmark) frameMs.reserve(static_cast<size_t>(options.benchFrames));
 
     while (!WindowShouldClose()) {
+        // Frame-to-frame wall clock, so the sample covers submit, GPU work and
+        // the buffer swap -- i.e. what the user actually feels.
+        const auto frameStart = std::chrono::steady_clock::now();
+        if (benchmark && prevStart.time_since_epoch().count() != 0) {
+            frameMs.push_back(std::chrono::duration<double, std::milli>(frameStart - prevStart)
+                                  .count());
+            if (static_cast<int>(frameMs.size()) >= options.benchFrames) break;
+        }
+        prevStart = frameStart;
         const float dt = std::min(GetFrameTime(), 0.1f);
         handleInput(dt);
 
@@ -78,6 +98,21 @@ int Application::run(const RunOptions& options) {
             break;
         }
         EndDrawing();
+    }
+
+    if (benchmark) {
+        // Drop the first frames: shader warm-up and the first mip uploads.
+        const size_t skip = std::min<size_t>(8, frameMs.size() / 4);
+        std::vector<double> samples(frameMs.begin() + static_cast<long>(skip), frameMs.end());
+        if (!samples.empty()) {
+            std::sort(samples.begin(), samples.end());
+            const double median = samples[samples.size() / 2];
+            const double p95 = samples[static_cast<size_t>(0.95 * (samples.size() - 1))];
+            const double best = samples.front();
+            std::printf("bench %dx%d internal %dx%d  median %.2f ms  p95 %.2f ms  best %.2f ms\n",
+                        options.width, options.height, m_renderer.sceneWidth(),
+                        m_renderer.sceneHeight(), median, p95, best);
+        }
     }
 
     m_renderer.shutdown();
