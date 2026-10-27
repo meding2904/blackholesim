@@ -28,7 +28,7 @@ const QualitySettings& qualitySettings(QualityPreset preset);
 struct SimulationParameters {
     bool diskVisible = true;
     float spin = 0.6f;            // dimensionless a/M, prograde disk
-    float rotationSpeed = 1.0f;   // multiples of the Keplerian rate
+    float rotationSpeed = 180.0f;   // multiples of the Keplerian rate
     float temperature = 6800.0f;  // Kelvin at the peak of the thin-disk profile
     float outerRadius = 26.0f;    // r_g
     float exposure = 0.75f;

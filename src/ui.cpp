@@ -225,7 +225,7 @@ void Ui::draw(SimulationParameters& params, const UiReadout& readout) {
         y += 26.0f;
     }
 
-    slider("ROTATION SPEED", params.rotationSpeed, 0.0f, 3.0f, "%.2f", "x");
+    slider("ROTATION SPEED", params.rotationSpeed, 0.0f, 180.0f, "%.2f", "x");
     slider("TEMPERATURE", params.temperature, 3000.0f, 20000.0f, "%.0f", " K");
     slider("OUTER RADIUS", params.outerRadius, 8.0f, 45.0f, "%.0f", " r_g");
     y += 10.0f;

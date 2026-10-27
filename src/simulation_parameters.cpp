@@ -20,7 +20,7 @@ const QualitySettings& qualitySettings(QualityPreset preset) {
 
 void SimulationParameters::clamp() {
     spin = std::clamp(spin, 0.0f, kMaxSpin);
-    rotationSpeed = std::clamp(rotationSpeed, 0.0f, 3.0f);
+    rotationSpeed = std::clamp(rotationSpeed, 0.0f, 180.0f);
     temperature = std::clamp(temperature, 3000.0f, 20000.0f);
     // The disk cannot reach inside its own ISCO, which shrinks with spin.
     outerRadius = std::clamp(outerRadius, iscoRadius() * 1.25f, 45.0f);

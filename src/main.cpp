@@ -21,7 +21,7 @@ void printUsage() {
         "  --yaw RAD          camera azimuth in radians (default 0.70)\n"
         "  --pitch RAD        camera elevation in radians (default 0.16)\n"
         "  --spin A           dimensionless spin a/M, 0..0.998 (default 0.6)\n"
-        "  --rotation X       disk rotation speed multiplier (default 1.0)\n"
+        "  --rotation X       disk rotation speed multiplier (default 180)\n"
         "  --temperature K    disk temperature in kelvin (default 6800)\n"
         "  --time SECONDS     initial disk animation phase\n"
         "  --paused           start with the disk animation paused\n"
