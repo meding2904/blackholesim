@@ -27,6 +27,14 @@ constexpr float kRenderHeight = 142.0f;
 constexpr float kScaleHeight = 112.0f;
 constexpr float kLegendHeight = 75.0f;
 
+// Full content heights. The thresholds below add 2 * kPanelY so the panel,
+// including its top and bottom margin, still fits on screen. Keeping the two in
+// sync prevents the layout from clipping a section it decided to show.
+constexpr float kBasePanelHeight = kPadTop + kHeaderHeight + kStatusHeight + kDiskHeight +
+                                   kRenderHeight + kPadBottom;
+constexpr float kLegendPanelHeight = kBasePanelHeight + kLegendHeight;
+constexpr float kScalePanelHeight = kLegendPanelHeight + kScaleHeight;
+
 const Color kPanelFill = {9, 12, 18, 216};
 const Color kPanelBorder = {255, 255, 255, 26};
 const Color kText = {236, 240, 246, 255};
@@ -45,15 +53,14 @@ struct Layout {
 
 Layout computeLayout(int screenHeight) {
     Layout layout;
-    if (screenHeight >= 790) {
+    if (screenHeight >= kScalePanelHeight + 2.0f * kPanelY) {
         layout.showScale = true;
         layout.showLegend = true;
-    } else if (screenHeight >= 700) {
+    } else if (screenHeight >= kLegendPanelHeight + 2.0f * kPanelY) {
         layout.showLegend = true;
     }
 
-    float height = kPadTop + kHeaderHeight + kStatusHeight + kDiskHeight + kRenderHeight +
-                   kPadBottom;
+    float height = kBasePanelHeight;
     if (layout.showScale) height += kScaleHeight;
     if (layout.showLegend) height += kLegendHeight;
 

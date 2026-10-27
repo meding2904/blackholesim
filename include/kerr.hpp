@@ -319,12 +319,16 @@ inline Vec3 kerrEscapeDirection(double theta, double phi, const KerrDerivatives&
 
 // Cubic Hermite root of cos(theta) inside a step. The linear root is off by
 // O(dl^2) with dl of a few r_g, which walks the hit radius by a visible fraction
-// of r_g from pixel to pixel.
+// of r_g from pixel to pixel. signR / signTheta are the *live* branch signs of
+// the step: they flip at turning points, so the end-point derivative has to be
+// rebuilt with them, not with the camera's initial signs (hardcoding the latter
+// put the interpolated hit radius up to ~0.8 r_g off after a radial turn).
 inline double kerrCrossingRadius(double a, const KerrRay& ray, double r0, double theta0,
                                  double cos0, double r1, double theta1, double cos1,
-                                 const KerrDerivatives& d0, double dl) {
+                                 const KerrDerivatives& d0, double dl, int signR,
+                                 int signTheta) {
     const KerrDerivatives d1 =
-        kerrDerivatives(a, ray.E, ray.L, ray.Q, r1, theta1, ray.signR, ray.signTheta);
+        kerrDerivatives(a, ray.E, ray.L, ray.Q, r1, theta1, signR, signTheta);
     const double mu0 = -d0.dtheta * std::sin(theta0) * dl;   // d(cos)/dlambda * dl
     const double mu1 = -d1.dtheta * std::sin(theta1) * dl;
     const double mr0 = d0.dr * dl;
@@ -423,7 +427,7 @@ inline KerrTrace traceKerrRay(Vec3 origin, Vec3 direction, double a, double step
 
         double rNew = r + (dl / 6.0) * (k1[0] + 2.0 * k2[0] + 2.0 * k3[0] + k4[0]);
         double thetaNew = theta + (dl / 6.0) * (k1[1] + 2.0 * k2[1] + 2.0 * k3[1] + k4[1]);
-        const double phiNew = phi + (dl / 6.0) * (k1[2] + 2.0 * k2[2] + 2.0 * k3[2] + k4[2]);
+        double phiNew = phi + (dl / 6.0) * (k1[2] + 2.0 * k2[2] + 2.0 * k3[2] + k4[2]);
 
         if (!std::isfinite(rNew) || !std::isfinite(thetaNew) || !std::isfinite(phiNew)) {
             out.finite = false;
@@ -436,7 +440,7 @@ inline KerrTrace traceKerrRay(Vec3 origin, Vec3 direction, double a, double step
         const double cosRaw = std::cos(thetaNew);
         if ((cosNow > 0.0) != (cosRaw > 0.0)) {
             const double rHit = kerrCrossingRadius(a, ray, r, theta, cosNow, rNew, thetaNew,
-                                                  cosRaw, d, dl);
+                                                  cosRaw, d, dl, signR, signTheta);
             if (out.crossings == 0) out.firstCrossingRadius = rHit;
             else if (out.crossings == 1) out.secondCrossingRadius = rHit;
             ++out.crossings;
@@ -462,8 +466,23 @@ inline KerrTrace traceKerrRay(Vec3 origin, Vec3 direction, double a, double step
         if (kerrPolarPotential(ray.E, ray.L, ray.Q, a, thetaNew) < 0.0) {
             // Mirror about the turning point itself (|cos| = uMax), not about
             // the step start, which would land on the wrong side of the plane.
+            // The hemisphere is taken from the step *start* (cosNow), the side
+            // the ray is actually approaching from; the raw step end can already
+            // be past the pole for a grazing step and would pick the wrong wall.
             const double mirrored = (cosNow >= 0.0 ? 2.0 * uMax : -2.0 * uMax) - cosRaw;
             thetaNew = std::acos(std::clamp(mirrored, -1.0, 1.0));
+            signTheta = -signTheta;
+        }
+        // Axis crossing: theta is a chart angle on [0, pi]. A ray with L = 0 has
+        // no centrifugal barrier and passes through the spin axis, where theta
+        // would step out of range. Relabel to the same physical point on the
+        // opposite meridian: theta -> -theta (north) or 2 pi - theta (south),
+        // phi -> phi + pi, dtheta -> -dtheta. The relabel is a chart change, so
+        // the geodesic is unchanged; skipping it used to make the escape
+        // azimuth jump by pi across the projected axis.
+        if (thetaNew < 0.0 || thetaNew > kPi) {
+            thetaNew = (thetaNew < 0.0) ? -thetaNew : 2.0 * kPi - thetaNew;
+            phiNew += kPi;
             signTheta = -signTheta;
         }
         r = rNew;
@@ -512,7 +531,7 @@ inline double kerrNullResidual(double a, double E, double L, double Q, double r,
     const double sinT = std::sin(theta);
     const double sigma = r * r + a * a * cosT * cosT;
     const double delta = r * r - 2.0 * r + a * a;
-    const double sin2 = std::max(sinT * sinT, 1e-6);
+    const double sin2 = std::max(sinT * sinT, 1e-30);
     // Covariant components from the velocities:
     //     Sigma p_r = Sigma^2/Delta dr,  p_theta = Sigma dtheta,  p_phi = L,  p_t = -E.
     const double pr = (sigma / std::max(delta, 1e-9)) * d.dr;

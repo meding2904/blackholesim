@@ -26,11 +26,10 @@ void CameraController::reset() {
 }
 
 void CameraController::orbit(float deltaX, float deltaY) {
-    m_targetYaw += deltaX;
+    if (!std::isfinite(deltaX)) deltaX = 0.0f;
+    if (!std::isfinite(deltaY)) deltaY = 0.0f;
+    m_targetYaw = std::remainder(m_targetYaw + deltaX, 2.0f * kPi);
     m_targetPitch = clampPitch(m_targetPitch + deltaY);
-    // Keep yaw bounded so it can never lose float precision after long sessions.
-    if (m_targetYaw > kPi) m_targetYaw -= 2.0f * kPi;
-    if (m_targetYaw < -kPi) m_targetYaw += 2.0f * kPi;
 }
 
 void CameraController::elevate(float deltaY) {
@@ -42,16 +41,23 @@ void CameraController::zoomBy(float delta) {
 }
 
 void CameraController::setView(float distance, float yaw, float pitch) {
-    m_targetDistance = m_distance = clampDistance(distance);
-    m_targetYaw = m_yaw = yaw;
-    m_targetPitch = m_pitch = clampPitch(pitch);
+    const float viewDistance = std::isfinite(distance) ? distance : kDefaultDistance;
+    const float viewYaw = std::isfinite(yaw) ? std::remainder(yaw, 2.0f * kPi) : kDefaultYaw;
+    const float viewPitch = std::isfinite(pitch) ? pitch : kDefaultPitch;
+    m_targetDistance = m_distance = clampDistance(viewDistance);
+    m_targetYaw = m_yaw = viewYaw;
+    m_targetPitch = m_pitch = clampPitch(viewPitch);
 }
 
 void CameraController::update(float dt) {
+    if (!std::isfinite(dt) || dt < 0.0f) dt = 0.0f;
     // Critically damped approach: independent of frame rate, never overshoots.
     const float alpha = 1.0f - std::exp(-dt * 14.0f);
     m_distance += (m_targetDistance - m_distance) * alpha;
-    m_yaw += (m_targetYaw - m_yaw) * alpha;
+    // Smooth along the shortest arc, then keep the yaw bounded so a long
+    // session cannot accumulate float error.
+    const float yawDelta = std::remainder(m_targetYaw - m_yaw, 2.0f * kPi);
+    m_yaw = std::remainder(m_yaw + yawDelta * alpha, 2.0f * kPi);
     m_pitch += (m_targetPitch - m_pitch) * alpha;
 }
 

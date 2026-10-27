@@ -7,7 +7,6 @@
 #include <vector>
 
 #include "raylib.h"
-#include "raylib.h"
 #include "rlgl.h"
 
 namespace bh {
@@ -15,16 +14,21 @@ namespace {
 // The shader's orbital phase uses physical time in r_g/c. Real ISCO periods are
 // ~92 t_g, so the animation clock is sped up for a watchable disk.
 constexpr float kDiskTimeScale = 12.0f;
+// Wrap the animation clock once an hour: the phase keeps moving forward, but a
+// long-running window never reaches the range where float steps become visible.
+constexpr float kDiskTimePeriod = 3600.0f;
 }  // namespace
 
 int Application::run(const RunOptions& options) {
     SetTraceLogLevel(LOG_WARNING);
     // vsync would cap the benchmark at the display rate, hiding the real cost.
     const bool benchmark = options.benchFrames > 0;
+    // The window stays visible while benchmarking: some drivers throttle or
+    // suspend rendering for hidden windows, which would distort the timings.
     SetConfigFlags(FLAG_WINDOW_RESIZABLE |
                    (benchmark ? 0 : static_cast<unsigned int>(FLAG_VSYNC_HINT)));
     InitWindow(options.width, options.height,
-               "Schwarzschild Black Hole - Gravitational Lensing");
+               "Kerr Black Hole - Gravitational Lensing");
     if (!IsWindowReady()) {
         std::fprintf(stderr, "Failed to create the application window.\n");
         return 1;
@@ -48,15 +52,20 @@ int Application::run(const RunOptions& options) {
     std::string error;
     if (!m_renderer.initialize(error)) {
         std::fprintf(stderr, "%s\n", error.c_str());
+        m_renderer.shutdown();
         CloseWindow();
         return 1;
     }
 
-    m_diskTime = options.startTime;
+    m_diskTime = std::fmod(options.startTime, kDiskTimePeriod);
     int frameIndex = 0;
     std::vector<double> frameMs;
     std::chrono::steady_clock::time_point prevStart{};
-    if (benchmark) frameMs.reserve(static_cast<size_t>(options.benchFrames));
+    // The CLI clamps --bench, but keep a small preallocation cap for callers
+    // that construct RunOptions directly.
+    if (benchmark) {
+        frameMs.reserve(static_cast<size_t>(std::min(options.benchFrames, 4096)));
+    }
 
     while (!WindowShouldClose()) {
         // Frame-to-frame wall clock, so the sample covers submit, GPU work and
@@ -71,7 +80,9 @@ int Application::run(const RunOptions& options) {
         const float dt = std::min(GetFrameTime(), 0.1f);
         handleInput(dt);
 
-        if (!m_params.paused) m_diskTime += dt * kDiskTimeScale;
+        if (!m_params.paused) {
+            m_diskTime = std::fmod(m_diskTime + dt * kDiskTimeScale, kDiskTimePeriod);
+        }
 
         const CameraFrame frame = m_camera.frame();
 
@@ -95,6 +106,9 @@ int Application::run(const RunOptions& options) {
             // TakeScreenshot reads the framebuffer without flushing the pending
             // 2D batch, so the UI would be missing from the image.
             rlDrawRenderBatchActive();
+            // Remove a stale file first, otherwise a failed write would still
+            // look like success in the check below.
+            std::remove(options.capturePath.c_str());
             TakeScreenshot(options.capturePath.c_str());
             EndDrawing();
             break;

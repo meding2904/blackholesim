@@ -345,7 +345,13 @@ inline CameraRayTrace traceCameraRay(Vec3 origin, Vec3 direction, double dphi, i
         }
         if (u <= uEscape && du < 0.0) {
             // Asymptotic direction: cos(psi) = -b du, sin(psi) = b u sqrt(1-2u).
-            const Vec3 dir = radial * (-s.b * du) + e2 * (s.b * u * std::sqrt(1.0 - 2.0 * u));
+            // The tangential basis is the current one, cross(planeNormal, radial),
+            // not the initial e2: radial has rotated through the whole sweep by
+            // now, and e2 is only the tangential direction at the camera (good
+            // for a straight line, wrong by the swept angle for a bent one).
+            const Vec3 tangentialNow = normalize(cross(planeNormal, radial));
+            const Vec3 dir =
+                radial * (-s.b * du) + tangentialNow * (s.b * u * std::sqrt(1.0 - 2.0 * u));
             out.outDirection = normalize(dir);
             out.escaped = true;
             return out;

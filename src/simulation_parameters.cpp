@@ -1,6 +1,7 @@
 #include "simulation_parameters.hpp"
 
 #include <algorithm>
+#include <cmath>
 
 namespace bh {
 
@@ -11,6 +12,11 @@ constexpr QualitySettings kQuality[kQualityCount] = {
     {"Balanced", 0.82f, 0.035f, 1200, 1},
     {"High", 0.88f, 0.022f, 1400, 2},
 };
+
+// NaN compares false against everything, so std::clamp would pass it through.
+float finiteOr(float value, float fallback) {
+    return std::isfinite(value) ? value : fallback;
+}
 }  // namespace
 
 const QualitySettings& qualitySettings(QualityPreset preset) {
@@ -19,14 +25,15 @@ const QualitySettings& qualitySettings(QualityPreset preset) {
 }
 
 void SimulationParameters::clamp() {
-    spin = std::clamp(spin, 0.0f, kMaxSpin);
-    rotationSpeed = std::clamp(rotationSpeed, 0.0f, 180.0f);
-    temperature = std::clamp(temperature, 3000.0f, 20000.0f);
+    spin = std::clamp(finiteOr(spin, 0.6f), 0.0f, kMaxSpin);
+    rotationSpeed = std::clamp(finiteOr(rotationSpeed, 180.0f), 0.0f, 180.0f);
+    temperature = std::clamp(finiteOr(temperature, 6800.0f), 3000.0f, 20000.0f);
     // The disk cannot reach inside its own ISCO, which shrinks with spin.
-    outerRadius = std::clamp(outerRadius, iscoRadius() * 1.25f, 45.0f);
-    exposure = std::clamp(exposure, 0.1f, 4.0f);
-    bloom = std::clamp(bloom, 0.0f, 2.0f);
-    stellarMass = std::clamp(stellarMass, 0.1f, 1.0e8f);
+    outerRadius =
+        std::clamp(finiteOr(outerRadius, 26.0f), iscoRadius() * 1.25f, 45.0f);
+    exposure = std::clamp(finiteOr(exposure, 0.75f), 0.1f, 4.0f);
+    bloom = std::clamp(finiteOr(bloom, 0.35f), 0.0f, 2.0f);
+    stellarMass = std::clamp(finiteOr(stellarMass, 10.0f), 0.1f, 1.0e8f);
     if (static_cast<int>(quality) < 0 || static_cast<int>(quality) >= kQualityCount) {
         quality = QualityPreset::Balanced;
     }

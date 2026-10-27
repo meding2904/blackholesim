@@ -334,18 +334,42 @@ void kerrDeriv(float r, float cu, float sn, KerrConst kc, float E, float L, floa
     float R = max(kerrRadial(kc, E, L, r), 0.0);
     float T = max(kerrPolarTheta(kc, Q, cu, sn), 0.0);
     float sin2 = max(sn * sn, 1.0e-20);
-    dr = sr * sqrt(R) / sigma;
-    dth = sc * sqrt(T) / sigma;
-    dph = (2.0 * a * r * E + L * (sigma - 2.0 * r) / sin2) / (sigma * delta);
+    float invSigma = 1.0 / max(sigma, 1.0e-9);
+    dr = sr * sqrt(R) * invSigma;
+    dth = sc * sqrt(T) * invSigma;
+    // Delta = 0 is the horizon, where the Boyer-Lindquist dphi/dl genuinely
+    // diverges. Guard the divide so a stray step that lands there cannot emit
+    // inf/NaN: the trace's horizon test then ends the ray instead of the NaN
+    // silently surviving every comparison and burning the step budget.
+    float denom = sigma * delta;
+    float numer = 2.0 * a * r * E + L * (sigma - 2.0 * r) / sin2;
+    dph = (abs(denom) > 1.0e-12) ? numer / denom : 0.0;
 }
 
 // Camera ray -> conserved (E, L, Q). The camera is a static observer: its
 // orthonormal frame gives k = e_t + n_r e_r + n_theta e_theta + n_phi e_phi,
 // which is the a = 0 construction generalised to Kerr.
+//
+// valid mirrors the CPU reference's rejection list (at/inside the horizon, a
+// zero-length direction, inside the ergosphere where no static observer exists,
+// |E| ~ 0). Those cases would otherwise yield NaN constants that no comparison
+// catches, so the pixel would integrate garbage for its whole step budget.
 void kerrRayInit(vec3 pos, vec3 dir, float a, out float r, out float cu, out float sn,
                  out float ph, out float E, out float L, out float Q, out float sr,
-                 out float sc) {
+                 out float sc, out bool valid) {
+    valid = false;
     r = length(pos);
+    cu = 0.0;
+    sn = 0.0;
+    ph = 0.0;
+    E = 0.0;
+    L = 0.0;
+    Q = 0.0;
+    sr = 1.0;
+    sc = 1.0;
+    float dirLen = length(dir);
+    if (r <= uHorizon || dirLen < 1.0e-9) return;
+    dir /= dirLen;
     cu = clamp(pos.y / max(r, 1.0e-4), -1.0, 1.0);
     float sinT = sqrt(max(1.0 - cu * cu, 1.0e-8));
     sn = sinT;
@@ -365,6 +389,7 @@ void kerrRayInit(vec3 pos, vec3 dir, float a, out float r, out float cu, out flo
     float gtt = -(1.0 - 2.0 * r / sigma);
     float gtphi = -2.0 * a * r * sin2 / sigma;
     float gphiphi = (r * r + a * a + 2.0 * a * a * r * sin2 / sigma) * sin2;
+    if (gtt >= 0.0) return;              // inside the ergosphere: no static observer
     float beta = inversesqrt(max(gphiphi - gtphi * gtphi / gtt, 1.0e-9));
     float alphaT = -(gtphi / gtt) * beta;
 
@@ -379,6 +404,7 @@ void kerrRayInit(vec3 pos, vec3 dir, float a, out float r, out float cu, out flo
     Q = pth * pth + cu * cu * (L * L / sin2 - a * a * E * E);
     sr = (kr >= 0.0) ? 1.0 : -1.0;
     sc = (kth >= 0.0) ? 1.0 : -1.0;      // sign of dtheta/dl
+    valid = abs(E) > 1.0e-12;
 }
 
 // Emission shift from a circular prograde equatorial orbit:
@@ -418,12 +444,17 @@ void shadeDiskPoint(inout vec3 accum, inout float transmittance, float r, float 
                   (0.90 + 0.20 * turb);
     // The shift is unbounded on paper for a ray emitted exactly along the
     // orbital motion; a thin, non-limb-darkened disk cannot resolve that, so the
-    // displayed range is bounded (documented approximation).
-    float g = clamp(kerrOrbitShift(r, a, -L / max(E, 1.0e-4)), 0.08, 5.0);
+    // displayed range is bounded (documented approximation). The upper bound is 8
+    // rather than 5 because real hits at a = 0.998 reach g ~ 8.1 near the inner
+    // rim; clamping lower flattened that rim into a hard band.
+    float g = clamp(kerrOrbitShift(r, a, -L / max(E, 1.0e-4)), 0.08, 8.0);
 
     vec3 tint = pow(blackbodyRGB(tNorm * uTempScale * g), vec3(2.2));
-    tint = mix(vec3(dot(tint, vec3(0.2126, 0.7152, 0.0722))), tint, 1.25);
+    // Saturation boost: the mean-preserving mix can undershoot 0 for a strongly
+    // saturated colour, and a negative channel is not a valid radiance.
+    tint = max(mix(vec3(dot(tint, vec3(0.2126, 0.7152, 0.0722))), tint, 1.25), vec3(0.0));
 
+    // g is clamped to [0.08, 8], so g^4 <= 4096 and the product stays finite.
     float brightness = uDiskGain * pow(tNorm, 3.4) * pow(g, 4.0);
     brightness *= 0.30 + 0.95 * turb;
     brightness *= 1.0 + 1.40 * exp(-(r - uDiskInner) * 0.50);   // hot inner rim
@@ -434,13 +465,17 @@ void shadeDiskPoint(inout vec3 accum, inout float transmittance, float r, float 
 
 // Equatorial crossing, found with a cubic Hermite root of cos(theta) inside the
 // step. A linear root is off by O(dl^2) with dl of a few r_g, which walks the hit
-// radius by a visible fraction of r_g from pixel to pixel.
+// radius by a visible fraction of r_g from pixel to pixel. sr/sc are the live
+// branch signs of this step: both endpoint derivatives have to be rebuilt with
+// them, otherwise a hit that follows a radial or polar turn is interpolated with
+// the opposite slope (measured: up to ~0.8 r_g of radius error).
 void accumulateDisk(inout vec3 accum, inout float transmittance, float r0, float cu0,
                     float sn0, float ph0, float r1, float cu1, float sn1, float ph1, float dl,
-                    KerrConst kc, float E, float L, float Q, float a, inout int diskHits) {
+                    float sr, float sc, KerrConst kc, float E, float L, float Q, float a,
+                    inout int diskHits) {
     float drA, dthA, dpA, drB, dthB, dpB;
-    kerrDeriv(r0, cu0, sn0, kc, E, L, Q, a, 1.0, 1.0, drA, dthA, dpA);
-    kerrDeriv(r1, cu1, sn1, kc, E, L, Q, a, 1.0, 1.0, drB, dthB, dpB);
+    kerrDeriv(r0, cu0, sn0, kc, E, L, Q, a, sr, sc, drA, dthA, dpA);
+    kerrDeriv(r1, cu1, sn1, kc, E, L, Q, a, sr, sc, drB, dthB, dpB);
     float mu0 = -sn0 * dthA * dl, mu1 = -sn1 * dthB * dl;   // d(cos)/dl * dl
     float mr0 = drA * dl, mr1 = drB * dl;
     float s = clamp(cu0 / (cu0 - cu1), 0.0, 1.0);
@@ -464,7 +499,7 @@ void accumulateDisk(inout vec3 accum, inout float transmittance, float r0, float
     // Incidence: the disk normal is +Y = cos(theta) rhat - sin(theta) thetahat,
     // so on the equator |cos i| = |v_theta| / |v|.
     float dr, dth, dph;
-    kerrDeriv(r, 0.0, 1.0, kc, E, L, Q, a, 1.0, 1.0, dr, dth, dph);
+    kerrDeriv(r, 0.0, 1.0, kc, E, L, Q, a, sr, sc, dr, dth, dph);
     float vTheta = r * dth;                      // sin(theta) = 1 here
     float vPhi = r * dph;
     float speed = sqrt(dr * dr + vTheta * vTheta + vPhi * vPhi);
@@ -485,7 +520,10 @@ void accumulateRim(inout vec3 accum, inout float transmittance, float r0, float 
     if (abs(cu) > 3.0 * slab) return;   // above the rim height: it passes overhead
 
     float dphi = mod(ph1 - ph0 + PI, 2.0 * PI) - PI;
-    float frac = clamp((uDiskInner - r0) / max(r1 - r0, 1.0e-6), 0.0, 1.0);
+    // Distance parameter of the r = uDiskInner crossing along the step. The step
+    // can be inward (r1 < r0), where a signed denominator is negative and clamps
+    // to 0 -- that painted the whole wall at the step start.
+    float frac = clamp((uDiskInner - r0) / max(abs(r1 - r0), 1.0e-6), 0.0, 1.0);
     float phi = ph0 + dphi * frac;
 
     float dr, dth, dph;
@@ -523,15 +561,22 @@ vec3 rayDirection(vec2 pixel) {
 // background or to the near side of the disk, and large once it wraps the hole.
 vec3 traceCameraRay(vec3 origin, vec3 dir, out float wind, out int diskHits) {
     diskHits = 0;
+    wind = 0.0;
     float r, cu, sn, phi, E, L, Q, sr, sc;
-    kerrRayInit(origin, dir, uSpin, r, cu, sn, phi, E, L, Q, sr, sc);
+    bool valid;
+    kerrRayInit(origin, dir, uSpin, r, cu, sn, phi, E, L, Q, sr, sc, valid);
+    if (!valid) return vec3(0.0);
     float phiStart = phi;
-    // Polar turning point, a ray constant. snT = 0 exactly for L = 0, whose
+    // Polar turning point, a ray constant. thetaT = 0 exactly for L = 0, whose
     // geodesic crosses the axis instead of bouncing; that case must skip the
-    // pole-proximity ruler below or it would stall at the axis.
+    // pole-proximity ruler below or it would stall at the axis. The gate is
+    // thetaT > 1e-12, matching the CPU reference (kerrStepLength): gating on
+    // sin(thetaT) > 1e-6 instead dropped the tiniest turning angles, which are
+    // exactly the near-axis rays the ruler exists for.
     float snT, C2, S2;
     kerrPolarTurn(E, L, Q, uSpin, snT, C2, S2);
-    bool polarGuard = snT > 1.0e-6;
+    float thetaT = asin(clamp(snT, 0.0, 1.0));
+    bool polarGuard = thetaT > 1.0e-12;
     KerrConst kc = kerrConstants(E, L, Q, uSpin);
 
     vec3 accum = vec3(0.0);
@@ -583,14 +628,23 @@ vec3 traceCameraRay(vec3 origin, vec3 dir, out float wind, out int diskHits) {
         float snn = sn + (dl / 6.0) * (k1sn + 2.0 * k2sn + 2.0 * k3sn + k4sn);
         float pn = phi + (dl / 6.0) * (k1p + 2.0 * k2p + 2.0 * k3p + k4p);
 
+        // A non-finite state can never satisfy any of the exit tests below, so
+        // it would silently spend the rest of the budget; end the ray as captured
+        // (black), which is what going non-finite near the horizon means.
+        if (isnan(rn) || isinf(rn) || isnan(cn) || isinf(cn) || isnan(snn) || isinf(snn) ||
+            isnan(pn) || isinf(pn)) {
+            transmittance = 0.0;
+            break;
+        }
+
         // Disk crossing, tested on the raw step end before any mirror: a
         // grazing ray that overshoots the lower polar turning point would
         // otherwise be reflected back to the positive side and lose its hit.
         bool crossed = (cu > 0.0) != (cn > 0.0);
         if (uDiskVisible > 0.5 && transmittance > 0.002) {
             if (crossed) {
-                accumulateDisk(accum, transmittance, r, cu, sn, phi, rn, cn, snn, pn, dl, kc,
-                               E, L, Q, uSpin, diskHits);
+                accumulateDisk(accum, transmittance, r, cu, sn, phi, rn, cn, snn, pn, dl, sr, sc,
+                               kc, E, L, Q, uSpin, diskHits);
             } else if ((r < uDiskInner) != (rn < uDiskInner)) {
                 accumulateRim(accum, transmittance, r, phi, rn, pn, cu, kc, E, L, Q, uSpin,
                               diskHits);
@@ -617,15 +671,29 @@ vec3 traceCameraRay(vec3 origin, vec3 dir, out float wind, out int diskHits) {
             // Mirror through the polar turning point (the double-angle
             // reflection on the unit pair) and flip the branch. L = 0 keeps
             // Theta > 0 and never enters this branch: that ray crosses the axis
-            // freely, which is its correct continuation.
+            // freely, which is its correct continuation. The wall is chosen from
+            // the step *start* hemisphere (cu), as in the CPU reference: the raw
+            // step end can already be past the pole on a grazing step, and then
+            // it would pick the opposite wall.
             float cn0 = cn;
-            if (cn >= 0.0) {
+            if (cu >= 0.0) {
                 cn = C2 * cn + S2 * snn;
                 snn = S2 * cn0 - C2 * snn;
             } else {
                 cn = C2 * cn - S2 * snn;
                 snn = -S2 * cn0 - C2 * snn;
             }
+            sc = -sc;
+        }
+        // Axis crossing (L = 0 only, no centrifugal barrier): sin(theta) is the
+        // chart's non-negative meridian coordinate, so it going negative means
+        // theta stepped through a pole. Relabel to the same physical point on
+        // the opposite meridian: (cos, sin) -> (cos, -sin), phi -> phi + pi,
+        // dtheta -> -dtheta. Without it the escape azimuth jumps by pi across
+        // the projected spin axis.
+        if (snn < 0.0) {
+            snn = -snn;
+            pn += PI;
             sc = -sc;
         }
         float nrm = inversesqrt(max(cn * cn + snn * snn, 1.0e-12));

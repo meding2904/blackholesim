@@ -35,23 +35,27 @@ RenderTexture2D createTarget(int width, int height) {
     return target;
 }
 
-void bindSampler(Shader shader, int location, Texture2D texture, int unit) {
-    if (location < 0) return;
-    int unitValue = unit;
-    SetShaderValue(shader, location, &unitValue, SHADER_UNIFORM_INT);
+void bindTexture(Texture2D texture, int unit) {
+    if (texture.id == 0) return;
     rlActiveTextureSlot(unit);
     rlEnableTexture(texture.id);
     rlActiveTextureSlot(0);
 }
 
 // Same, for the sky cube map: rlEnableTexture would bind GL_TEXTURE_2D.
-void bindCubemapSampler(Shader shader, int location, TextureCubemap texture, int unit) {
-    if (location < 0 || texture.id == 0) return;
-    int unitValue = unit;
-    SetShaderValue(shader, location, &unitValue, SHADER_UNIFORM_INT);
+void bindCubemapTexture(TextureCubemap texture, int unit) {
+    if (texture.id == 0) return;
     rlActiveTextureSlot(unit);
     rlEnableTextureCubemap(texture.id);
     rlActiveTextureSlot(0);
+}
+
+// Collect every uniform that the driver did not expose (renamed, removed or
+// optimised out) so the error names the actual culprit instead of a subset.
+void requireUniform(std::string& missing, const char* name, int location) {
+    if (location >= 0) return;
+    if (!missing.empty()) missing += ", ";
+    missing += name;
 }
 
 // BeginTextureMode changes the orthographic projection to the target size and
@@ -85,7 +89,12 @@ std::string resolveAssetPath(const std::string& relative) {
     return candidates.front();
 }
 
+Renderer::~Renderer() { shutdown(); }
+
 bool Renderer::initialize(std::string& error) {
+    m_dumpCamera = std::getenv("BH_DUMP_CAM") != nullptr;
+    m_debug = std::getenv("BH_DEBUG") != nullptr;
+
     if (!loadShaders(error)) return false;
 
     m_diskNoise = createDiskNoiseTexture();
@@ -100,9 +109,31 @@ bool Renderer::initialize(std::string& error) {
         return false;
     }
 
-    // Sampler units are fixed (2..3); raylib's 2D batch uses unit 0.
-    int unit = 2;
-    SetShaderValue(m_sceneShader, m_scene.noise, &unit, SHADER_UNIFORM_INT);
+    // Constant uniforms: upload once instead of every frame. Sampler units are
+    // fixed (the 2D batch owns unit 0); only the texture bindings change.
+    const int noiseUnit = 2;
+    const int skyUnit = 3;
+    SetShaderValue(m_sceneShader, m_scene.noise, &noiseUnit, SHADER_UNIFORM_INT);
+    SetShaderValue(m_sceneShader, m_scene.sky, &skyUnit, SHADER_UNIFORM_INT);
+
+    const float tanHalfFov = std::tan(kVerticalFovDegrees * 0.5f * DEG2RAD);
+    SetShaderValue(m_sceneShader, m_scene.tanHalfFov, &tanHalfFov, SHADER_UNIFORM_FLOAT);
+
+    // Angular size of one deep-field texel: a cube face spans 90 degrees, so the
+    // shader can turn a pixel footprint into a mip level without knowing the
+    // bake size.
+    const float skyTexel = 1.5707963f / static_cast<float>(kSkyFaceSize);
+    SetShaderValue(m_sceneShader, m_scene.skyTexel, &skyTexel, SHADER_UNIFORM_FLOAT);
+
+    const int blurTexUnit = 1;
+    SetShaderValue(m_blurShader, m_blurTex, &blurTexUnit, SHADER_UNIFORM_INT);
+
+    const int compositeSceneUnit = 1;
+    const int compositeNearUnit = 2;
+    const int compositeFarUnit = 3;
+    SetShaderValue(m_compositeShader, m_compScene, &compositeSceneUnit, SHADER_UNIFORM_INT);
+    SetShaderValue(m_compositeShader, m_compNear, &compositeNearUnit, SHADER_UNIFORM_INT);
+    SetShaderValue(m_compositeShader, m_compFar, &compositeFarUnit, SHADER_UNIFORM_INT);
 
     m_initialized = true;
     return true;
@@ -154,14 +185,33 @@ bool Renderer::loadShaders(std::string& error) {
     m_scene.skyTexel = GetShaderLocation(m_sceneShader, "uSkyTexel");
     m_scene.photonPro = GetShaderLocation(m_sceneShader, "uPhotonPro");
 
-    if (m_scene.resolution < 0 || m_scene.noise < 0 || m_scene.sky < 0) {
-        char detail[192];
-        std::snprintf(detail, sizeof(detail),
-                      "Black hole shader is missing uniforms: res=%d cam=%d noise=%d "
-                      "step=%d max=%d",
-                      m_scene.resolution, m_scene.camPos, m_scene.noise,
-                      m_scene.stepSize, m_scene.maxSteps);
-        error = detail;
+    std::string missing;
+    requireUniform(missing, "uResolution", m_scene.resolution);
+    requireUniform(missing, "uCamPos", m_scene.camPos);
+    requireUniform(missing, "uCamRight", m_scene.camRight);
+    requireUniform(missing, "uCamUp", m_scene.camUp);
+    requireUniform(missing, "uCamForward", m_scene.camForward);
+    requireUniform(missing, "uTanHalfFov", m_scene.tanHalfFov);
+    requireUniform(missing, "uTime", m_scene.time);
+    requireUniform(missing, "uDiskVisible", m_scene.diskVisible);
+    requireUniform(missing, "uDiskInner", m_scene.diskInner);
+    requireUniform(missing, "uDiskOuter", m_scene.diskOuter);
+    requireUniform(missing, "uRotationSpeed", m_scene.rotationSpeed);
+    requireUniform(missing, "uTempScale", m_scene.tempScale);
+    requireUniform(missing, "uDiskGain", m_scene.diskGain);
+    requireUniform(missing, "uDiskDensity", m_scene.diskDensity);
+    requireUniform(missing, "uStepSize", m_scene.stepSize);
+    requireUniform(missing, "uSpin", m_scene.spin);
+    requireUniform(missing, "uHorizon", m_scene.horizon);
+    requireUniform(missing, "uMaxSteps", m_scene.maxSteps);
+    requireUniform(missing, "uAASamples", m_scene.aaSamples);
+    requireUniform(missing, "uStarGain", m_scene.starGain);
+    requireUniform(missing, "uNoise", m_scene.noise);
+    requireUniform(missing, "uSky", m_scene.sky);
+    requireUniform(missing, "uSkyTexel", m_scene.skyTexel);
+    requireUniform(missing, "uPhotonPro", m_scene.photonPro);
+    if (!missing.empty()) {
+        error = "Black hole shader is missing uniforms: " + missing;
         return false;
     }
 
@@ -172,6 +222,18 @@ bool Renderer::loadShaders(std::string& error) {
     m_blurRadius = GetShaderLocation(m_blurShader, "uRadius");
     m_blurThreshold = GetShaderLocation(m_blurShader, "uThreshold");
 
+    missing.clear();
+    requireUniform(missing, "uTex", m_blurTex);
+    requireUniform(missing, "uUVScale", m_blurUVScale);
+    requireUniform(missing, "uTexel", m_blurTexel);
+    requireUniform(missing, "uDirection", m_blurDirection);
+    requireUniform(missing, "uRadius", m_blurRadius);
+    requireUniform(missing, "uThreshold", m_blurThreshold);
+    if (!missing.empty()) {
+        error = "Blur shader is missing uniforms: " + missing;
+        return false;
+    }
+
     m_compScene = GetShaderLocation(m_compositeShader, "uScene");
     m_compNear = GetShaderLocation(m_compositeShader, "uBloomNear");
     m_compFar = GetShaderLocation(m_compositeShader, "uBloomFar");
@@ -179,25 +241,57 @@ bool Renderer::loadShaders(std::string& error) {
     m_compExposure = GetShaderLocation(m_compositeShader, "uExposure");
     m_compBloom = GetShaderLocation(m_compositeShader, "uBloomStrength");
 
+    missing.clear();
+    requireUniform(missing, "uScene", m_compScene);
+    requireUniform(missing, "uBloomNear", m_compNear);
+    requireUniform(missing, "uBloomFar", m_compFar);
+    requireUniform(missing, "uResolution", m_compResolution);
+    requireUniform(missing, "uExposure", m_compExposure);
+    requireUniform(missing, "uBloomStrength", m_compBloom);
+    if (!missing.empty()) {
+        error = "Composite shader is missing uniforms: " + missing;
+        return false;
+    }
+
     rlDisableDepthTest();
     return true;
 }
 
 void Renderer::shutdown() {
     releaseTargets();
-    if (m_initialized) {
+
+    // Free whatever was created, even when initialize() failed halfway and
+    // m_initialized was never set.
+    if (m_diskNoise.id != 0) {
         UnloadTexture(m_diskNoise);
-        if (m_sky.id != 0) rlUnloadTexture(m_sky.id);
         m_diskNoise = {};
-        m_sky = {};
-        m_initialized = false;
     }
-    UnloadShader(m_sceneShader);
-    UnloadShader(m_blurShader);
-    UnloadShader(m_compositeShader);
+    if (m_sky.id != 0) {
+        rlUnloadTexture(m_sky.id);
+        m_sky = {};
+    }
+    m_initialized = false;
+
+    if (m_sceneShader.id != 0) UnloadShader(m_sceneShader);
+    if (m_blurShader.id != 0) UnloadShader(m_blurShader);
+    if (m_compositeShader.id != 0) UnloadShader(m_compositeShader);
     m_sceneShader = {};
     m_blurShader = {};
     m_compositeShader = {};
+
+    m_scene = {};
+    m_blurTex = -1;
+    m_blurUVScale = -1;
+    m_blurTexel = -1;
+    m_blurDirection = -1;
+    m_blurRadius = -1;
+    m_blurThreshold = -1;
+    m_compScene = -1;
+    m_compNear = -1;
+    m_compFar = -1;
+    m_compResolution = -1;
+    m_compExposure = -1;
+    m_compBloom = -1;
 }
 
 void Renderer::releaseTargets() {
@@ -283,7 +377,7 @@ void Renderer::drawScene(const CameraFrame& camera, const SimulationParameters& 
     SetShaderValue(m_sceneShader, m_scene.camForward, &forward, SHADER_UNIFORM_VEC3);
     SetShaderValue(m_sceneShader, m_scene.camRight, &right, SHADER_UNIFORM_VEC3);
     SetShaderValue(m_sceneShader, m_scene.camUp, &up, SHADER_UNIFORM_VEC3);
-    if (std::getenv("BH_DUMP_CAM") != nullptr) {
+    if (m_dumpCamera) {
         std::printf(
             "CAM %.6f %.6f %.6f | FWD %.6f %.6f %.6f | RIGHT %.6f %.6f %.6f | UP %.6f %.6f %.6f"
             " | RES %d %d\n",
@@ -291,8 +385,6 @@ void Renderer::drawScene(const CameraFrame& camera, const SimulationParameters& 
             right.z, up.x, up.y, up.z, m_sceneWidth, m_sceneHeight);
     }
 
-    const float tanHalfFov = std::tan(kVerticalFovDegrees * 0.5f * DEG2RAD);
-    SetShaderValue(m_sceneShader, m_scene.tanHalfFov, &tanHalfFov, SHADER_UNIFORM_FLOAT);
     SetShaderValue(m_sceneShader, m_scene.time, &diskTime, SHADER_UNIFORM_FLOAT);
 
     const float diskVisible = params.diskVisible ? 1.0f : 0.0f;
@@ -328,14 +420,9 @@ void Renderer::drawScene(const CameraFrame& camera, const SimulationParameters& 
     SetShaderValue(m_sceneShader, m_scene.maxSteps, &maxSteps, SHADER_UNIFORM_INT);
     SetShaderValue(m_sceneShader, m_scene.aaSamples, &aaSamples, SHADER_UNIFORM_INT);
     SetShaderValue(m_sceneShader, m_scene.starGain, &starGain, SHADER_UNIFORM_FLOAT);
-    // Angular size of one deep-field texel: a cube face spans 90 degrees, so the
-    // shader can turn a pixel footprint into a mip level without knowing the
-    // bake size.
-    const float skyTexel = 1.5707963f / static_cast<float>(kSkyFaceSize);
-    SetShaderValue(m_sceneShader, m_scene.skyTexel, &skyTexel, SHADER_UNIFORM_FLOAT);
 
-    bindSampler(m_sceneShader, m_scene.noise, m_diskNoise, 2);
-    bindCubemapSampler(m_sceneShader, m_scene.sky, m_sky, 3);
+    bindTexture(m_diskNoise, 2);
+    bindCubemapTexture(m_sky, 3);
 
     rlDisableDepthTest();
     DrawRectangle(0, 0, m_sceneWidth, m_sceneHeight, WHITE);
@@ -343,7 +430,7 @@ void Renderer::drawScene(const CameraFrame& camera, const SimulationParameters& 
     EndShaderMode();
     EndTextureMode();
 
-    if (std::getenv("BH_DEBUG") != nullptr) {
+    if (m_debug) {
         static int logged = 0;
         if (logged < 3) {
             ++logged;
@@ -380,7 +467,7 @@ void Renderer::drawBloom() {
         SetShaderValue(m_blurShader, m_blurDirection, direction, SHADER_UNIFORM_VEC2);
         SetShaderValue(m_blurShader, m_blurRadius, &radius, SHADER_UNIFORM_FLOAT);
         SetShaderValue(m_blurShader, m_blurThreshold, &threshold, SHADER_UNIFORM_FLOAT);
-        bindSampler(m_blurShader, m_blurTex, source, 1);
+        bindTexture(source, 1);
 
         BeginTextureMode(target);
         ClearBackground(BLANK);
@@ -389,7 +476,10 @@ void Renderer::drawBloom() {
     };
 
     // Near glow: threshold + horizontal blur at 1/4 res, then vertical.
-    pass(m_bloomA, m_sceneTarget.texture, 1.0f, 0.0f, 1.0f, kBloomThreshold);
+    // The 8-bit fallback target clamps the scene at 1.0, so the HDR threshold
+    // would select nothing; use a lower one there to keep some glow.
+    const float threshold = m_hdr ? kBloomThreshold : 0.85f;
+    pass(m_bloomA, m_sceneTarget.texture, 1.0f, 0.0f, 1.0f, threshold);
     pass(m_bloomB, m_bloomA.texture, 0.0f, 1.0f, 1.0f, -1.0f);
     // Far halo: blur the already-blurred image at 1/8 res with a wider kernel.
     pass(m_bloomC, m_bloomB.texture, 1.0f, 0.0f, 2.6f, -1.0f);
@@ -413,11 +503,11 @@ void Renderer::drawComposite(const SimulationParameters& params) {
     SetShaderValue(m_compositeShader, m_compExposure, &exposure, SHADER_UNIFORM_FLOAT);
     SetShaderValue(m_compositeShader, m_compBloom, &bloom, SHADER_UNIFORM_FLOAT);
 
-    bindSampler(m_compositeShader, m_compScene, m_sceneTarget.texture, 1);
-    bindSampler(m_compositeShader, m_compNear, m_bloomB.texture, 2);
-    bindSampler(m_compositeShader, m_compFar, m_bloomD.texture, 3);
+    bindTexture(m_sceneTarget.texture, 1);
+    bindTexture(m_bloomB.texture, 2);
+    bindTexture(m_bloomD.texture, 3);
 
-    if (std::getenv("BH_DEBUG") != nullptr) {
+    if (m_debug) {
         static int logged = 0;
         if (logged++ == 0) {
             TraceLog(LOG_WARNING,
