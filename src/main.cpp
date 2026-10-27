@@ -1,3 +1,7 @@
+#include <algorithm>
+#include <cerrno>
+#include <cfloat>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -7,6 +11,8 @@
 #include "simulation_parameters.hpp"
 
 namespace {
+
+constexpr int kMaxBenchFrames = 100000;
 
 void printUsage() {
     std::printf(
@@ -36,13 +42,47 @@ void printUsage() {
         "  space pause       R reset      H toggle UI       esc quit\n");
 }
 
+// Strict decimal parse: the entire string must be consumed and the result must
+// be finite and representable as a float. NaN/inf and ERANGE are rejected.
+bool parseFloat(const char* value, float& out) {
+    if (value == nullptr || *value == '\0') return false;
+    errno = 0;
+    char* end = nullptr;
+    const double parsed = std::strtod(value, &end);
+    if (end == value || *end != '\0' || errno == ERANGE) return false;
+    if (!std::isfinite(parsed)) return false;
+    if (parsed < -FLT_MAX || parsed > FLT_MAX) return false;
+    out = static_cast<float>(parsed);
+    return true;
+}
+
+bool parseInteger(const char* value, long& out) {
+    if (value == nullptr || *value == '\0') return false;
+    errno = 0;
+    char* end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' || errno == ERANGE) return false;
+    out = parsed;
+    return true;
+}
+
 bool parseSize(const char* value, int& width, int& height) {
-    int w = 0;
-    int h = 0;
-    if (std::sscanf(value, "%dx%d", &w, &h) != 2) return false;
+    if (value == nullptr) return false;
+
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long w = std::strtoul(value, &end, 10);
+    if (end == value || errno == ERANGE || (*end != 'x' && *end != 'X')) return false;
+
+    const char* heightText = end + 1;
+    errno = 0;
+    char* heightEnd = nullptr;
+    const unsigned long h = std::strtoul(heightText, &heightEnd, 10);
+    if (heightEnd == heightText || *heightEnd != '\0' || errno == ERANGE) return false;
+
     if (w < 320 || h < 240 || w > 7680 || h > 4320) return false;
-    width = w;
-    height = h;
+    width = static_cast<int>(w);
+    height = static_cast<int>(h);
     return true;
 }
 
@@ -68,12 +108,19 @@ bool parseQuality(const char* value, int& quality) {
 int main(int argc, char** argv) {
     bh::RunOptions options;
 
+    const auto invalidValue = [](const char* name) {
+        std::fprintf(stderr, "Invalid value for %s (try --help)\n", name);
+        printUsage();
+        return 1;
+    };
+
     for (int i = 1; i < argc; ++i) {
         const char* arg = argv[i];
         const auto next = [&](const char* name) -> const char* {
             if (i + 1 >= argc) {
                 std::fprintf(stderr, "Missing value for %s\n", name);
-                std::exit(2);
+                printUsage();
+                std::exit(1);
             }
             return argv[++i];
         };
@@ -83,34 +130,50 @@ int main(int argc, char** argv) {
             return 0;
         } else if (std::strcmp(arg, "--size") == 0) {
             if (!parseSize(next("--size"), options.width, options.height)) {
-                std::fprintf(stderr, "Invalid --size, expected WxH (e.g. 1600x900)\n");
-                return 2;
+                return invalidValue("--size (expected WxH, e.g. 1600x900)");
             }
         } else if (std::strcmp(arg, "--quality") == 0) {
             if (!parseQuality(next("--quality"), options.quality)) {
-                std::fprintf(stderr, "Invalid --quality (performance|balanced|high)\n");
-                return 2;
+                return invalidValue("--quality (performance|balanced|high)");
             }
         } else if (std::strcmp(arg, "--spin") == 0) {
-            options.spin = static_cast<float>(std::atof(next("--spin")));
+            if (!parseFloat(next("--spin"), options.spin)) return invalidValue("--spin");
         } else if (std::strcmp(arg, "--distance") == 0) {
-            options.distance = static_cast<float>(std::atof(next("--distance")));
+            if (!parseFloat(next("--distance"), options.distance)) {
+                return invalidValue("--distance");
+            }
         } else if (std::strcmp(arg, "--yaw") == 0) {
-            options.yaw = static_cast<float>(std::atof(next("--yaw")));
+            if (!parseFloat(next("--yaw"), options.yaw)) return invalidValue("--yaw");
         } else if (std::strcmp(arg, "--pitch") == 0) {
-            options.pitch = static_cast<float>(std::atof(next("--pitch")));
+            if (!parseFloat(next("--pitch"), options.pitch)) return invalidValue("--pitch");
         } else if (std::strcmp(arg, "--rotation") == 0) {
-            options.rotationSpeed = static_cast<float>(std::atof(next("--rotation")));
+            if (!parseFloat(next("--rotation"), options.rotationSpeed)) {
+                return invalidValue("--rotation");
+            }
         } else if (std::strcmp(arg, "--temperature") == 0) {
-            options.temperature = static_cast<float>(std::atof(next("--temperature")));
+            if (!parseFloat(next("--temperature"), options.temperature)) {
+                return invalidValue("--temperature");
+            }
         } else if (std::strcmp(arg, "--time") == 0) {
-            options.startTime = static_cast<float>(std::atof(next("--time")));
+            if (!parseFloat(next("--time"), options.startTime)) return invalidValue("--time");
         } else if (std::strcmp(arg, "--bench") == 0) {
-            options.benchFrames = std::atoi(next("--bench"));
-        } else if (std::strcmp(arg, "--spin") == 0) {
-            options.spin = static_cast<float>(std::atof(next("--spin")));
+            long frames = 0;
+            if (!parseInteger(next("--bench"), frames)) return invalidValue("--bench");
+            if (frames < 1 || frames > kMaxBenchFrames) {
+                std::fprintf(stderr, "Warning: --bench clamped to the range 1..%d\n",
+                             kMaxBenchFrames);
+            }
+            options.benchFrames =
+                static_cast<int>(std::clamp(frames, 1L, static_cast<long>(kMaxBenchFrames)));
         } else if (std::strcmp(arg, "--frames") == 0) {
-            options.captureFrames = std::atoi(next("--frames"));
+            long frames = 0;
+            if (!parseInteger(next("--frames"), frames)) return invalidValue("--frames");
+            if (frames < 1 || frames > kMaxBenchFrames) {
+                std::fprintf(stderr, "Warning: --frames clamped to the range 1..%d\n",
+                             kMaxBenchFrames);
+            }
+            options.captureFrames =
+                static_cast<int>(std::clamp(frames, 1L, static_cast<long>(kMaxBenchFrames)));
         } else if (std::strcmp(arg, "--capture") == 0) {
             options.capturePath = next("--capture");
         } else if (std::strcmp(arg, "--paused") == 0) {
@@ -119,7 +182,8 @@ int main(int argc, char** argv) {
             options.noUi = true;
         } else {
             std::fprintf(stderr, "Unknown option: %s (try --help)\n", arg);
-            return 2;
+            printUsage();
+            return 1;
         }
     }
 

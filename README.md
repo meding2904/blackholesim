@@ -371,10 +371,12 @@ filaments.
   and then falls in, so a narrow dark filament appears at the one azimuth where
   the view is tangential (most visible near edge-on, at high spin). A volumetric
   or rim-modelled disk would fill it.
-* **The Doppler factor is bounded** to `g ∈ [0.08, 5]` for display. On paper `g`
+* **The Doppler factor is bounded** to `g ∈ [0.08, 8]` for display. On paper `g`
   diverges for a ray emitted exactly along the orbital motion; a thin,
   non-limb-darkened disk cannot resolve that, so `g⁴` is clipped instead of
-  saturating the frame.
+  saturating the frame. The upper bound is set just above the largest shift a
+  real hit reaches (`g ≈ 8.1` at `a = 0.998`, near the inner rim), so the bright
+  rim is not flattened into a band.
 * **Step budget = capture.** A ray that exhausts its budget is treated as
   captured. This is exact to within the shadow edge (those rays are within a
   fraction of a pixel of the critical curve), but it does mean the outermost

@@ -12,6 +12,8 @@ namespace bh {
 //   scene (RGBA16F) -> bright pass + blur pyramid -> ACES composite -> screen
 class Renderer {
 public:
+    ~Renderer();
+
     bool initialize(std::string& error);
     void shutdown();
     void render(const CameraFrame& camera, const SimulationParameters& params, float diskTime);
@@ -92,6 +94,8 @@ private:
     bool m_targetsValid = false;
     bool m_hdr = true;
     bool m_initialized = false;
+    bool m_dumpCamera = false;  // BH_DUMP_CAM, cached at initialize()
+    bool m_debug = false;       // BH_DEBUG, cached at initialize()
 };
 
 // Resolves "shaders/x.fs" relative to the executable, the working directory or

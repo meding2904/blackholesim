@@ -18,7 +18,7 @@ inline constexpr int kQualityCount = 3;
 struct QualitySettings {
     const char* label;
     float renderScale;  // internal resolution relative to the window
-    float phiStep;      // RK4 step in orbital phase (radians)
+    float phiStep;      // relative affine step h: dl = h * r (legacy name)
     int maxSteps;       // bounded integration => no GPU hangs
     int aaSamples;      // rays per pixel
 };
