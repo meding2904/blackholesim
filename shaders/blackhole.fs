@@ -39,10 +39,24 @@ uniform float uHorizon;       // r+ = 1 + sqrt(1 - a^2)
 uniform int   uMaxSteps;
 uniform int   uAASamples;
 uniform float uStarGain;
+uniform float uPhotonPro;     // prograde photon orbit r_ph(a): the capture threshold
 uniform sampler2D uNoise;     // tileable procedural turbulence
+uniform samplerCube uSky;     // baked deep field: faint stars, band, dust
+uniform float uSkyTexel;      // radians subtended by one deep-field texel at mip 0
 
 const float PI = 3.14159265359;
 const float ESCAPE_RADIUS = 900.0;
+
+// Far-field radial ruler. Past this radius, once a ray is moving outward and its
+// radial potential is still positive at twice the radius (so no turning point is
+// within reach), the radial ruler is allowed to grow: the residual bending out
+// there is small enough that a six times longer step leaves the escape direction
+// where a converged integration puts it (measured: 0.01 px median, 1.2 px p99
+// against a fine reference) while removing about a quarter of all steps. The
+// angular and pole rulers still cap the step, so a perigee is resolved as finely
+// as it was.
+const float FAR_RADIUS = 60.0;
+const float FAR_GROWTH = 6.0;
 
 // ---------------------------------------------------------------------------
 //  Utility
@@ -74,19 +88,33 @@ vec3 blackbodyRGB(float kelvin) {
 }
 
 // ---------------------------------------------------------------------------
-//  Sky: deterministic star field, reconstructed analytically
+//  Sky: a prefiltered deep field plus analytic bright stars
 //
-//  A star is a point source, which a texture cannot represent through this
-//  pipeline: one screen pixel already covers less sky than a texel of a
-//  4096-wide map, so stars quantise into hard squares, and the 10-100x
-//  magnification near the shadow inflates a single texel into a block that
-//  smears into a streak. Stars therefore live in a spherical cell lattice and
-//  are drawn as Gaussians one screen pixel wide, which keeps them the same size
-//  at any magnification and moves them continuously as the camera moves.
+//  The background carries two kinds of signal and they want opposite treatment:
+//
+//    * Unresolved light -- the galactic band, its dust lanes, nebulosity and
+//      the star haze (the faint population's mean light). A pixel that cannot
+//      resolve detail should
+//      receive the *average* radiance of what it covers, which is exactly what
+//      sampling a mip level returns. So it lives in the baked cube map, sampled
+//      at the LOD matching the pixel's footprint on the sky. This is also what
+//      fixes the tangential caustic: there the lens folds a long strip of sky
+//      into one pixel, and a point-sampled star field turns that strip into
+//      confetti, where a footprint-matched mip returns the strip's mean.
+//
+//    * Bright stars -- point sources, which must keep a constant angular size at
+//      any magnification. One screen pixel already covers far less sky than a
+//      texel of any affordable cube map, so they stay analytic: Gaussians one
+//      pixel wide, widened (and dimmed by the same factor) as the lens
+//      compresses the image, and faded into the strip mean once the strip
+//      holds more stars than the lattice search can honestly resolve.
 // ---------------------------------------------------------------------------
+
 // 0..1 from a lattice cell id (photometry: magnitude and colour).
 float hashCell(vec3 p) {
-    return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+    vec3 q = fract(p * vec3(0.1031, 0.1030, 0.0973));
+    q += dot(q, q.yzx + 33.33);
+    return fract((q.x + q.y) * q.z);
 }
 
 vec4 hashCell4(vec3 p) {
@@ -96,40 +124,77 @@ vec4 hashCell4(vec3 p) {
     return fract((q.xxyz + q.yzzw) * q.zywx);
 }
 
-vec3 sampleSky(vec3 dir, float pixelAngle, float wind) {
-    // 0.018 rad cells: ~19k cells where the unit sphere crosses the lattice.
+// How much wider than one pixel a sky feature has to be drawn. wind (the
+// azimuth a ray swept) stands in for the Jacobian of the lens map: it grows as
+// the ray approaches the critical curve, which is where the compression is.
+float skySpread(float wind) { return 1.0 + 0.9 * max(wind - 2.0, 0.0); }
+
+// Unresolved sky, prefiltered for one pixel: the footprint is the pixel's
+// angular size stretched by the lens compression. LOD below 0 would magnify the
+// bake (and shimmer), so it is clamped at the base level. The bake stores the
+// square root of radiance (the band is faint enough that 8-bit linear would
+// quantise it into patches), so square it back here.
+vec3 sampleDeepField(vec3 dir, float footprint) {
+    float lod = log2(max(footprint, uSkyTexel) / uSkyTexel);
+    vec3 encoded = textureLod(uSky, dir, clamp(lod, 0.0, 8.0)).rgb;
+    return encoded * encoded;
+}
+
+vec3 sampleBrightStars(vec3 dir, float pixelAngle, float spread) {
+    // 0.018 rad cells: a few thousand cells where the unit sphere crosses the
+    // lattice, of which a few percent hold a star.
     const float CELL = 0.018;
-    // Winding tracks how close the ray came to the critical curve. There the sky
-    // image is folded, so one pixel covers a long strip of sky and a single
-    // point sample of it picks an arbitrary star: the ring speckles into
-    // confetti. Widening the star profile by the same factor spreads that flux
-    // back out, which is what the fold does to the image anyway.
-    float spread = 1.0 + 0.9 * max(wind - 2.0, 0.0);
-    float sigma = 0.70 * pixelAngle * spread;
+    // The eight cells searched below share the lattice corner nearest the ray
+    // and cover half a cell around it. The profile must stay inside that
+    // margin: widen sigma past it and stars just outside the search silently
+    // drop out while the lattice cuts each profile off at the block edge --
+    // the square "confetti" that used to plague folded sky. So the widening
+    // stops at SIGMA_MAX, where 3*SIGMA_MAX is exactly half a cell.
+    const float SIGMA_MAX = CELL / 6.0;
+    float sigmaWanted = 0.70 * pixelAngle * spread;
+    float sigma = min(sigmaWanted, SIGMA_MAX);
     float inv2s2 = 1.0 / (2.0 * sigma * sigma);
     float cutoff = 9.0 * sigma * sigma;
     float flux = 1.0 / (spread * spread);   // widening must not add light
 
-    vec3 base = floor(dir / CELL);
+    // Once the footprint grows past twice the cap, one pixel covers a strip of
+    // sky holding several stars and no single profile is meaningful: the
+    // honest answer is their average, which the deep field already carries
+    // (its star haze, sampled at the same footprint). Cross-fade the discrete
+    // layer into that mean -- the brightness stays correct and the folded sky
+    // reads as smooth lensed glow instead of clipped blobs.
+    float resolve = 1.0 - smoothstep(1.0, 2.0, sigmaWanted / SIGMA_MAX);
+
+    // Only the cells that share the lattice corner nearest the ray can hold a
+    // star within the cutoff (3 sigma is at most half a cell), so those eight
+    // are the entire search. Testing the 3x3x3 neighbourhood of the corner
+    // instead is 3.4x the work for the same image.
+    vec3 cell = dir / CELL;
+    vec3 base = floor(cell);
+    vec3 corner = base + step(vec3(0.5), cell - base);
     vec3 sum = vec3(0.0);
-    for (int i = -1; i <= 1; ++i)
-    for (int j = -1; j <= 1; ++j)
-    for (int k = -1; k <= 1; ++k) {
-        vec3 id = base + vec3(float(i), float(j), float(k));
+    for (int i = 0; i < 8; ++i) {
+        vec3 id = corner - vec3(float(i & 1), float((i >> 1) & 1), float((i >> 2) & 1));
         vec4 h = hashCell4(id);
-        if (h.w > 0.10) continue;                 // most cells are empty sky
+        if (h.w > 0.04) continue;              // most cells are empty sky
         vec3 star = normalize(id + h.xyz);
         float sep2 = max(2.0 - 2.0 * dot(dir, star), 0.0);   // ~angle^2
         if (sep2 > cutoff) continue;
 
         float phot = hashCell(id);
-        float mag = pow(phot, 5.0);               // a few bright, many faint
+        float mag = phot * phot * phot * phot * phot;   // a few bright, many faint
         float kelvin = 4200.0 + 12500.0 * pow(fract(phot * 37.0), 0.9);
         vec3 tint = blackbodyRGB(kelvin);
         tint /= max(max(tint.r, tint.g), max(tint.b, 0.001));
         sum += tint * (exp(-sep2 * inv2s2) * (0.010 + 0.55 * mag) * flux);
     }
-    return sum * uStarGain;
+
+    // Mean radiance of the lattice: 0.04/CELL^2 stars per steradian, each with
+    // mean flux 2*pi*(0.7*pixelAngle)^2 * (0.010 + 0.55/6). The cross-fade
+    // target, and what a folded strip converges to.
+    float starMean = 0.04 * 6.2831853 * 0.49 * pixelAngle * pixelAngle *
+                     (0.010 + 0.55 / 6.0) / (CELL * CELL);
+    return mix(vec3(starMean), sum, resolve);
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +399,8 @@ float kerrOrbitShift(float r, float a, float lOverE) {
 void shadeDiskPoint(inout vec3 accum, inout float transmittance, float r, float phi,
                     float incidence, float edgeInner, KerrConst kc, float E, float L, float Q,
                     float a) {
+    // (diskHits is bumped by the caller: a pixel only needs multi-sampling when
+    // it actually gathered compressed disk detail, see main())
     float column = clamp(2.0 * diskHalfThickness(r) / incidence, 0.0, 24.0);
 
     float edgeIn = edgeInner * smoothstep(uDiskInner, uDiskInner * 1.18, r);
@@ -370,7 +437,7 @@ void shadeDiskPoint(inout vec3 accum, inout float transmittance, float r, float 
 // radius by a visible fraction of r_g from pixel to pixel.
 void accumulateDisk(inout vec3 accum, inout float transmittance, float r0, float cu0,
                     float sn0, float ph0, float r1, float cu1, float sn1, float ph1, float dl,
-                    KerrConst kc, float E, float L, float Q, float a) {
+                    KerrConst kc, float E, float L, float Q, float a, inout int diskHits) {
     float drA, dthA, dpA, drB, dthB, dpB;
     kerrDeriv(r0, cu0, sn0, kc, E, L, Q, a, 1.0, 1.0, drA, dthA, dpA);
     kerrDeriv(r1, cu1, sn1, kc, E, L, Q, a, 1.0, 1.0, drB, dthB, dpB);
@@ -404,6 +471,7 @@ void accumulateDisk(inout vec3 accum, inout float transmittance, float r0, float
     float incidence = clamp(abs(vTheta) / max(speed, 1.0e-6), 0.02, 1.0);
 
     shadeDiskPoint(accum, transmittance, r, phi, incidence, 1.0, kc, E, L, Q, a);
+    ++diskHits;
 }
 
 // Inner rim wall. The disk is a thin slab with a vertical edge at the ISCO, so a
@@ -411,7 +479,8 @@ void accumulateDisk(inout vec3 accum, inout float transmittance, float r0, float
 // rather than passing through a hole. Without this the edge-on view shows a dark
 // filament wherever the first crossing falls inside the disk.
 void accumulateRim(inout vec3 accum, inout float transmittance, float r0, float ph0, float r1,
-                   float ph1, float cu, KerrConst kc, float E, float L, float Q, float a) {
+                   float ph1, float cu, KerrConst kc, float E, float L, float Q, float a,
+                   inout int diskHits) {
     float slab = diskHalfThickness(uDiskInner) / max(uDiskInner, 1.0);
     if (abs(cu) > 3.0 * slab) return;   // above the rim height: it passes overhead
 
@@ -425,6 +494,7 @@ void accumulateRim(inout vec3 accum, inout float transmittance, float r0, float 
     // The wall faces radially, so its incidence is the radial velocity share.
     float incidence = clamp(abs(dr) / max(speed, 1.0e-6), 0.08, 1.0);
     shadeDiskPoint(accum, transmittance, uDiskInner * 1.12, phi, incidence, 1.0, kc, E, L, Q, a);
+    ++diskHits;
 }
 
 // ---------------------------------------------------------------------------
@@ -451,7 +521,8 @@ vec3 rayDirection(vec2 pixel) {
 
 // wind: total azimuth swept, which is small for a ray that goes straight to the
 // background or to the near side of the disk, and large once it wraps the hole.
-vec3 traceCameraRay(vec3 origin, vec3 dir, out float wind) {
+vec3 traceCameraRay(vec3 origin, vec3 dir, out float wind, out int diskHits) {
+    diskHits = 0;
     float r, cu, sn, phi, E, L, Q, sr, sc;
     kerrRayInit(origin, dir, uSpin, r, cu, sn, phi, E, L, Q, sr, sc);
     float phiStart = phi;
@@ -476,8 +547,15 @@ vec3 traceCameraRay(vec3 origin, vec3 dir, out float wind) {
         // Stage 1 doubles as the step ruler: same point, same derivative.
         float k1r, k1th, k1p, k2r, k2th, k2p, k3r, k3th, k3p, k4r, k4th, k4p;
         kerrDeriv(r, cu, sn, kc, E, L, Q, uSpin, sr, sc, k1r, k1th, k1p);
+        // Radial ruler, with the far-field growth folded in before the caps below
+        // so that the angular and pole rulers keep their authority: the growth
+        // only ever lengthens a step that the geometry already allowed.
+        float radial = uStepSize * max(r, 1.0);
+        if (sr > 0.0 && r > FAR_RADIUS && kerrRadial(kc, E, L, 2.0 * r) > 0.0) {
+            radial = max(radial, FAR_GROWTH * uStepSize * r);
+        }
         float rate = max(abs(k1p), abs(k1th));
-        float dl = uStepSize * max(r, 1.0);
+        float dl = radial;
         if (rate > 1.0e-9) dl = min(dl, uStepSize * 0.6 / rate);
         // Pole-proximity ruler: keep the theta travel a quarter of the distance
         // to the pole, so the L/sin^2(theta) spike in dphi cannot change by
@@ -512,10 +590,14 @@ vec3 traceCameraRay(vec3 origin, vec3 dir, out float wind) {
         if (uDiskVisible > 0.5 && transmittance > 0.002) {
             if (crossed) {
                 accumulateDisk(accum, transmittance, r, cu, sn, phi, rn, cn, snn, pn, dl, kc,
-                               E, L, Q, uSpin);
+                               E, L, Q, uSpin, diskHits);
             } else if ((r < uDiskInner) != (rn < uDiskInner)) {
-                accumulateRim(accum, transmittance, r, phi, rn, pn, cu, kc, E, L, Q, uSpin);
+                accumulateRim(accum, transmittance, r, phi, rn, pn, cu, kc, E, L, Q, uSpin,
+                              diskHits);
             }
+            // An opaque disk ends the march: no later image of the disk and no
+            // piece of sky can contribute through it any more.
+            if (transmittance < 0.002) break;
         }
 
         // Turning points: mirror through the root and flip the branch. R depends
@@ -555,6 +637,17 @@ vec3 traceCameraRay(vec3 origin, vec3 dir, out float wind) {
         sn = snn;
         phi = pn;
 
+        // Capture theorem: a ray inside the prograde photon orbit and moving
+        // inward has its perigee below the smallest radius a photon can turn at,
+        // so it is captured -- and provably captured *here*, not eventually.
+        // Without this the dphi/dL spike as Delta -> 0 shrinks the angular ruler
+        // towards zero and a plunging ray creeps until its budget runs out: that
+        // used to cost a black shadow pixel its full 1200 steps.
+        if (sr < 0.0 && r <= uPhotonPro) {
+            transmittance = 0.0;
+            break;
+        }
+
         // Event horizon: Delta < 0 is exactly the region between the horizons.
         if (r <= uHorizon || kerrDelta(r, uSpin) <= 0.0) {
             transmittance = 0.0;
@@ -588,7 +681,10 @@ vec3 traceCameraRay(vec3 origin, vec3 dir, out float wind) {
     vec3 color = accum;
     if (transmittance > 0.002) {
         float pixelAngle = 2.0 * uTanHalfFov / uResolution.y;
-        color += transmittance * sampleSky(escapeDir, pixelAngle, wind);
+        float spread = skySpread(wind);
+        color += transmittance * uStarGain *
+                 (sampleDeepField(escapeDir, pixelAngle * spread) +
+                  sampleBrightStars(escapeDir, pixelAngle, spread));
     }
     return color;
 }
@@ -609,17 +705,22 @@ void main() {
     vec2 origin = base + dither * 0.7;
 
     float wind = 0.0;
-    vec3 color = traceCameraRay(uCamPos, rayDirection(origin + aaOffset(0, count)), wind);
+    int diskHits = 0;
+    vec3 color =
+        traceCameraRay(uCamPos, rayDirection(origin + aaOffset(0, count)), wind, diskHits);
 
     // A ray that has wound half a turn or more returns through a strongly
     // compressed image: one pixel then spans many r_g of disk, temperature and
     // Doppler factor included, so a single sample picks one of them and the
-    // result speckles. Refine only those pixels; the rest of the frame does not
-    // need four rays.
-    int total = (wind > 3.0 && count < 4) ? 4 : count;
+    // result speckles. Refine those pixels only, and only when the compressed
+    // image is the *disk*: folded sky is handled by the deep-field LOD and the
+    // widened star profiles, and a captured ray is black whichever way it is
+    // sampled. Gating on diskHits keeps the four rays where they buy something:
+    // at Balanced the old rule refined 42% of pixels, this one 16%.
+    int total = (wind > 3.0 && diskHits > 0 && count < 4) ? 4 : count;
     for (int s = 1; s < 4; ++s) {
         if (s >= total) break;
-        color += traceCameraRay(uCamPos, rayDirection(origin + aaOffset(s, total)), wind);
+        color += traceCameraRay(uCamPos, rayDirection(origin + aaOffset(s, total)), wind, diskHits);
     }
     color /= float(total);
 

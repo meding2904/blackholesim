@@ -128,7 +128,10 @@ held as state and flipped at turning points. The step is the strictest of three
 rulers:
 
 * **geometric**, `dλ = h·r` — strides through the nearly straight far field and
-  stays finite at a turning point;
+  stays finite at a turning point. Beyond `60 r_g`, a ray moving outward whose
+  radial potential is still positive at `2r` (no turning point ahead) gets its
+  cap grown to `6h·r` — the far ruler. The rulers below keep their authority, so
+  the growth only ever lengthens a step the bending already allowed;
 * **angular**, `dλ = 0.6h / max(|dφ/dλ|, |dθ/dλ|)` — the bending near the hole is
   what the image is made of; a purely geometric ruler under-resolves it by ~4×
   at `h = 0.035`;
@@ -149,10 +152,19 @@ about the start can land on the wrong side of the equatorial plane and silently
 drop disk hits. A ray with exactly `L = 0` never enters the mirror branch: its
 geodesic passes through the axis, which is its correct continuation.
 
-Termination:
+Termination (the far ruler and the capture cut are mirrored in the CPU tracer
+`include/kerr.hpp` and pinned by `tests/physics_tests.cpp` against untricked
+reference traces):
 
+* `r ≤ r_ph^pro` and moving inward → captured. The prograde photon orbit is the
+  smallest radius any photon can turn at, so the ray's perigee is provably below
+  every turning point — it is captured *here*, not eventually. Without the cut a
+  plunging ray creeps through the `dφ/dλ` spike as `Δ → 0` until its budget runs
+  out; a black shadow pixel used to cost its full 1200 steps.
 * `r ≤ r₊` or `Δ < 0` → captured, the pixel stays on the shadow;
-* `r ≥ 60 r_g` and `dr/dλ > 0` → escaped, the background is sampled along the
+* disk transmittance below 0.002 → the march ends early: an opaque disk leaves
+  no later image and no piece of sky able to contribute through it;
+* `r ≥ 900 r_g` and `dr/dλ > 0` → escaped, the background is sampled along the
   reconstructed 3D direction `r̂·dr + θ̂·r·dθ/dλ + φ̂·r sin θ·dφ/dλ`;
 * a step budget that runs out means a near-critical orbit still winding around
   the photon sphere; it is treated as captured. That is what bounds the shader's
@@ -193,11 +205,29 @@ time: the physical photon's energy measured by the orbiting emitter is
 colour (`T_obs = gT(r)`) and the beaming `I ∝ g⁴`, which is why the approaching
 side is blue-white and blown out while the receding side is dim orange.
 
-**Sky.** A 4096 × 2048 procedural star field (22 000 deterministic stars with a
-magnitude distribution, blackbody colours and a few bright ones), sampled at
-LOD 0 through the computed escape direction. Because the sample is taken along
-the *deflected* direction, stars are displaced, magnified into arcs and multiply
-imaged for free.
+**Sky.** Two layers, split by what survives being magnified:
+
+* **Baked deep field** — a 512-per-face cubemap with a full mip chain, holding
+  only *smooth* unresolved light: the galactic band (warm bulge, filaments of
+  dust with exponential extinction), a star haze carrying the mean light of the
+  faint population, and two emission nebulae. No discrete stars are baked: a
+  texel-scale blob magnifies into a visible block exactly where the lens map
+  stretches the sky — that is the grey "confetti" the old render showed along
+  the caustics. The bake stores √radiance (the band is faint enough that 8-bit
+  linear quantises it into patches) and is sampled with an explicit footprint
+  LOD — the pixel's angular size widened by the local lens compression — so a
+  folded pixel reads a blurrier mip instead of aliasing.
+* **Analytic stars** — resolved stars drawn in the shader from a 3D hash
+  lattice (0.018 rad cells, 4 % occupied), blackbody-tinted with a steep
+  magnitude distribution. The profile width follows the pixel footprint but is
+  capped at `CELL/6`, the largest σ the eight-cell lattice search can cover
+  without clipping profiles into squares. Where the footprint outgrows the cap
+  — a pixel covering a whole folded strip of sky — the layer cross-fades into
+  the strip's mean radiance (which the deep field's star haze already carries),
+  so folded sky reads as smooth lensed glow instead of clipped blobs.
+
+Because both layers are sampled along the *deflected* direction, the sky is
+displaced, magnified into arcs and multiply imaged for free.
 
 ## Rendering
 
@@ -218,15 +248,24 @@ needs is missing, and reports the GLSL compiler log with line numbers on failure
 | Balanced | 82 % | 0.035 | 1200 | 1 |
 | High | 88 % | 0.022 | 1400 | 2 (jittered) |
 
-Measured on the development machine (integrated GPU, 1280 × 720 window, spin 0.9,
-camera at 46 `r_g`, near edge-on — the heaviest common view), median of three
-80-frame runs:
+Measured on this branch's development machine (1280 × 720 window, spin 0.9,
+camera at 46 `r_g`, near edge-on — the heaviest common view; medians and p95 of
+an 80-frame `--bench 80` run per preset), before and after the sky rework:
 
-| Preset | Internal | Median | p95 |
-|---|---|---|---|
-| Performance | 794 × 446 | 3.3 ms | 4.3 ms |
-| Balanced | 1050 × 590 | 15.6 ms | 17.0 ms |
-| High | 1126 × 634 | 49 ms | 52 ms |
+| Preset | Internal | Median (old sky) | Median (reworked) | p95 (reworked) |
+|---|---|---|---|---|
+| Performance | 794 × 446 | 9.4 ms | 5.5 ms | 7.6 ms |
+| Balanced | 1050 × 590 | 38.2 ms | 23.4 ms | 25.0 ms |
+| High | 1126 × 634 | 76.6 ms | 53.3 ms | 58.2 ms |
+
+The rework is **1.4–1.7× faster at every preset** and the sky looks better: the
+march tricks below cut steps (the far field strides 6×, a plunging ray stops at
+the photon orbit instead of burning its budget, an opaque disk ends the march),
+and the sky is one cubemap fetch with footprint LOD plus an eight-cell lattice
+search instead of an over-wide star profile.
+
+(An earlier table on different hardware measured the old sky at 3.3 / 15.6 /
+49 ms; absolute numbers are machine-dependent, the ratios above are not.)
 
 ### Where the time goes, and what is worth optimizing
 
@@ -340,10 +379,20 @@ filaments.
   captured. This is exact to within the shadow edge (those rays are within a
   fraction of a pixel of the critical curve), but it does mean the outermost
   higher-order images are truncated at the budget rather than resolved.
-* **Point-sampled sky.** The star field is sampled at LOD 0 with no anisotropic
-  filtering, so along the tangential caustic (the column where the lens map is
-  degenerate) stars alias into dashes or dots. The Einstein rings themselves are
-  correct; only their sub-pixel structure aliases.
+* **Folded sky is smooth.** Where one pixel covers a whole folded strip of sky
+  (right at the critical curve), individual stars are replaced by the strip's
+  mean radiance: no discrete profile survives that magnification at texel scale
+  without turning into blocks, so the innermost lensed sky reads as smooth glow
+  rather than resolved stars.
+* **Far-ruler gate.** The 6× far-field step growth assumes no radial turning
+  point between `r` and `2r` (`R(2r) > 0`); a pair of turning points inside that
+  window would be stepped over. Tests pin the rule's verdicts against untricked
+  traces.
+* **Residual speckle at the polar cusps.** A sparse spray of orange specks
+  survives around the cusp points above and below the shadow. Layer isolation
+  traces it to the disk code path — it is there with the whole sky switched off
+  — and it predates the sky rework, which removed the block confetti that used
+  to bury it.
 * **RK4 accuracy.** The bending of a test ray agrees with a converged integration
   to ≈0.005 rad at every preset (0.0055 at `h = 0.055`, 0.0055 at `h = 0.035`,
   0.0033 at `h = 0.022` over `b = 10…34 r_g`); at `h = 0.002` the residual falls to

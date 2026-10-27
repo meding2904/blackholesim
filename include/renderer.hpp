@@ -44,6 +44,9 @@ private:
         int aaSamples = -1;
         int starGain = -1;
         int noise = -1;
+        int sky = -1;
+        int skyTexel = -1;
+        int photonPro = -1;
     };
 
     bool loadShaders(std::string& error);
@@ -74,6 +77,7 @@ private:
     int m_compBloom = -1;
 
     Texture2D m_diskNoise = {};
+    TextureCubemap m_sky = {};   // baked deep field (faint stars, band, dust)
 
     RenderTexture2D m_sceneTarget = {};
     RenderTexture2D m_bloomA = {};

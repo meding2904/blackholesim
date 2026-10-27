@@ -3,6 +3,7 @@
 // these checks cover the initial conditions, capture criteria and integration
 // accuracy that the GPU path depends on.
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 
@@ -244,6 +245,117 @@ void testRelativisticShift() {
                "Keplerian angular velocity at the ISCO");
     check(bh::circularOrbitShift(30.0, 20.0) > 0.0, "outer disk shift stays positive");
     check(std::isfinite(bh::circularOrbitShift(3.0, 0.0)), "shift is finite at the photon sphere");
+}
+
+void testMarchRules() {
+    section("Shader march rules (far ruler, capture cut)");
+
+    // Deterministic ray battery across spins: the camera sits on a sphere of
+    // radius 30 r_g and each ray is aimed at a random point in a ball of radius
+    // 12 r_g around the hole, so the sample covers both the shadow (captured)
+    // and the surrounding sky (escaped).
+    std::uint32_t seed = 0x9E3779B9u;
+    const auto rnd = [&seed]() {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        return static_cast<double>(seed) / 4294967296.0;
+    };
+
+    struct Ray {
+        bh::Vec3 origin;
+        bh::Vec3 dir;
+        double a;
+    };
+    Ray rays[72];
+    const double spins[3] = {0.0, 0.5, 0.9};
+    int rayCount = 0;
+    for (int s = 0; s < 3; ++s) {
+        for (int i = 0; i < 24; ++i) {
+            const double ct = 2.0 * rnd() - 1.0;
+            const double st = std::sqrt(std::max(0.0, 1.0 - ct * ct));
+            const double ph = 2.0 * bh::kPi * rnd();
+            const bh::Vec3 origin{30.0 * st * std::cos(ph), 30.0 * ct, 30.0 * st * std::sin(ph)};
+            const double tr = 12.0 * std::pow(rnd(), 1.5);
+            const double tct = 2.0 * rnd() - 1.0;
+            const double tst = std::sqrt(std::max(0.0, 1.0 - tct * tct));
+            const double tph = 2.0 * bh::kPi * rnd();
+            const bh::Vec3 target{tr * tst * std::cos(tph), tr * tct, tr * tst * std::sin(tph)};
+            const bh::Vec3 toTarget{target.x - origin.x, target.y - origin.y, target.z - origin.z};
+            rays[rayCount++] = {origin, bh::normalize(toTarget), spins[s]};
+        }
+    }
+
+    const auto verdict = [](const bh::KerrTrace& t) { return t.escaped ? 1 : (t.captured ? 2 : 0); };
+    const auto angle = [](const bh::Vec3& u, const bh::Vec3& v) {
+        return std::acos(std::clamp(bh::dot(u, v), -1.0, 1.0));
+    };
+    // acos(dot) amplifies float noise near 1 (two identical unit vectors give
+    // ~1e-8 rad), so exact-identity claims compare the dot gap instead.
+    const auto dotGap = [](const bh::Vec3& u, const bh::Vec3& v) {
+        return 1.0 - std::clamp(bh::dot(u, v), -1.0, 1.0);
+    };
+
+    int farVerdictBad = 0;
+    int cutVerdictBad = 0;
+    int escapedPairs = 0;
+    int capturedRays = 0;
+    double worstFarAngle = 0.0;
+    double worstCutGap = 0.0;
+    long refSteps = 0;
+    long farSteps = 0;
+    long plainSteps = 0;
+    long cutSteps = 0;
+
+    for (int i = 0; i < rayCount; ++i) {
+        const Ray& rc = rays[i];
+        const bh::KerrMarchOptions plain{false, false};
+        const bh::KerrMarchOptions farOnly{true, false};
+        const bh::KerrMarchOptions cutOnly{false, true};
+        const auto ref = bh::traceKerrRay(rc.origin, rc.dir, rc.a, 0.01, 60000, 900.0, plain);
+        const auto withFar =
+            bh::traceKerrRay(rc.origin, rc.dir, rc.a, 0.01, 60000, 900.0, farOnly);
+        const auto withCut =
+            bh::traceKerrRay(rc.origin, rc.dir, rc.a, 0.01, 60000, 900.0, cutOnly);
+
+        refSteps += ref.steps;
+        farSteps += withFar.steps;
+        if (verdict(ref) != verdict(withFar)) ++farVerdictBad;
+        if (verdict(ref) != verdict(withCut)) ++cutVerdictBad;
+        if (ref.escaped && withFar.escaped) {
+            ++escapedPairs;
+            worstFarAngle = std::max(worstFarAngle, angle(ref.outDirection, withFar.outDirection));
+        }
+        if (ref.escaped && withCut.escaped) {
+            worstCutGap = std::max(worstCutGap, dotGap(ref.outDirection, withCut.outDirection));
+        }
+        if (ref.captured) {
+            ++capturedRays;
+            plainSteps += ref.steps;
+            cutSteps += withCut.steps;
+        }
+    }
+
+    check(escapedPairs >= 20, "battery covers escaping rays", std::to_string(escapedPairs) + " rays");
+    check(capturedRays >= 10, "battery covers captured rays", std::to_string(capturedRays) + " rays");
+
+    check(farVerdictBad == 0, "far ruler preserves capture/escape verdicts",
+          std::to_string(farVerdictBad) + " mismatching rays");
+    check(worstFarAngle < 0.005,
+          "far-ruler escape directions within 0.005 rad of the converged reference",
+          "worst = " + std::to_string(worstFarAngle) + " rad");
+    check(farSteps < refSteps, "far ruler shortens the march",
+          std::to_string(farSteps) + " vs " + std::to_string(refSteps) + " steps");
+
+    check(cutVerdictBad == 0, "capture cut preserves capture/escape verdicts",
+          std::to_string(cutVerdictBad) + " mismatching rays");
+    // The cut only ever fires on rays that are provably captured, so escaped
+    // rays follow a bit-identical path: their escape directions must match to
+    // numerical noise.
+    check(worstCutGap < 1.0e-12, "capture cut leaves escaped rays untouched",
+          "worst 1-cos = " + std::to_string(worstCutGap));
+    check(cutSteps < plainSteps, "capture cut stops plunging rays early",
+          std::to_string(cutSteps) + " vs " + std::to_string(plainSteps) + " steps");
 }
 
 void testRobustness() {
@@ -561,6 +673,7 @@ int main() {
     testKerrMatchesSchwarzschild();
     testKerrDiskCrossings();
     testKerrAxisSeam();
+    testMarchRules();
     testRobustness();
     testParameters();
 

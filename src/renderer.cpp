@@ -17,6 +17,10 @@ constexpr float kDiskGain = 2.2f;
 constexpr float kDiskOpticalDepth = 6.0f;
 constexpr float kStarGain = 1.6f;
 constexpr float kBloomThreshold = 1.3f;
+// Deep-field cube map resolution: one face per 90 degrees, so 512 puts a texel
+// at 0.003 rad. That is two to three screen pixels at 720p, which is the right
+// order for the unresolved population (a texel is a prefiltered point source).
+constexpr int kSkyFaceSize = 512;
 
 RenderTexture2D createTarget(int width, int height) {
     RenderTexture2D target =
@@ -37,6 +41,16 @@ void bindSampler(Shader shader, int location, Texture2D texture, int unit) {
     SetShaderValue(shader, location, &unitValue, SHADER_UNIFORM_INT);
     rlActiveTextureSlot(unit);
     rlEnableTexture(texture.id);
+    rlActiveTextureSlot(0);
+}
+
+// Same, for the sky cube map: rlEnableTexture would bind GL_TEXTURE_2D.
+void bindCubemapSampler(Shader shader, int location, TextureCubemap texture, int unit) {
+    if (location < 0 || texture.id == 0) return;
+    int unitValue = unit;
+    SetShaderValue(shader, location, &unitValue, SHADER_UNIFORM_INT);
+    rlActiveTextureSlot(unit);
+    rlEnableTextureCubemap(texture.id);
     rlActiveTextureSlot(0);
 }
 
@@ -77,6 +91,12 @@ bool Renderer::initialize(std::string& error) {
     m_diskNoise = createDiskNoiseTexture();
     if (m_diskNoise.id == 0) {
         error = "Failed to create the procedural disk turbulence texture.";
+        return false;
+    }
+
+    m_sky = uploadSkyCubemap(bakeSkyCubemap(kSkyFaceSize));
+    if (m_sky.id == 0) {
+        error = "Failed to create the procedural deep-field sky cube map.";
         return false;
     }
 
@@ -130,8 +150,11 @@ bool Renderer::loadShaders(std::string& error) {
     m_scene.aaSamples = GetShaderLocation(m_sceneShader, "uAASamples");
     m_scene.starGain = GetShaderLocation(m_sceneShader, "uStarGain");
     m_scene.noise = GetShaderLocation(m_sceneShader, "uNoise");
+    m_scene.sky = GetShaderLocation(m_sceneShader, "uSky");
+    m_scene.skyTexel = GetShaderLocation(m_sceneShader, "uSkyTexel");
+    m_scene.photonPro = GetShaderLocation(m_sceneShader, "uPhotonPro");
 
-    if (m_scene.resolution < 0 || m_scene.noise < 0) {
+    if (m_scene.resolution < 0 || m_scene.noise < 0 || m_scene.sky < 0) {
         char detail[192];
         std::snprintf(detail, sizeof(detail),
                       "Black hole shader is missing uniforms: res=%d cam=%d noise=%d "
@@ -164,6 +187,9 @@ void Renderer::shutdown() {
     releaseTargets();
     if (m_initialized) {
         UnloadTexture(m_diskNoise);
+        if (m_sky.id != 0) rlUnloadTexture(m_sky.id);
+        m_diskNoise = {};
+        m_sky = {};
         m_initialized = false;
     }
     UnloadShader(m_sceneShader);
@@ -291,13 +317,25 @@ void Renderer::drawScene(const CameraFrame& camera, const SimulationParameters& 
     SetShaderValue(m_sceneShader, m_scene.stepSize, &stepSize, SHADER_UNIFORM_FLOAT);
     const float spin = params.spin;
     const float horizon = params.horizonRadius();
+    // The prograde photon orbit is the capture theorem's threshold: a ray that
+    // is inside it and moving inward can never escape, so the shader stops it
+    // there instead of letting the Boyer-Lindquist dphi spike creep it to a step
+    // budget it cannot spend.
+    const float photonPro = static_cast<float>(kerrPhotonOrbitRadius(spin, true));
     SetShaderValue(m_sceneShader, m_scene.spin, &spin, SHADER_UNIFORM_FLOAT);
     SetShaderValue(m_sceneShader, m_scene.horizon, &horizon, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(m_sceneShader, m_scene.photonPro, &photonPro, SHADER_UNIFORM_FLOAT);
     SetShaderValue(m_sceneShader, m_scene.maxSteps, &maxSteps, SHADER_UNIFORM_INT);
     SetShaderValue(m_sceneShader, m_scene.aaSamples, &aaSamples, SHADER_UNIFORM_INT);
     SetShaderValue(m_sceneShader, m_scene.starGain, &starGain, SHADER_UNIFORM_FLOAT);
+    // Angular size of one deep-field texel: a cube face spans 90 degrees, so the
+    // shader can turn a pixel footprint into a mip level without knowing the
+    // bake size.
+    const float skyTexel = 1.5707963f / static_cast<float>(kSkyFaceSize);
+    SetShaderValue(m_sceneShader, m_scene.skyTexel, &skyTexel, SHADER_UNIFORM_FLOAT);
 
     bindSampler(m_sceneShader, m_scene.noise, m_diskNoise, 2);
+    bindCubemapSampler(m_sceneShader, m_scene.sky, m_sky, 3);
 
     rlDisableDepthTest();
     DrawRectangle(0, 0, m_sceneWidth, m_sceneHeight, WHITE);

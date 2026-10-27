@@ -348,8 +348,20 @@ inline double kerrCrossingRadius(double a, const KerrRay& ray, double r0, double
     return h00(s) * r0 + h10(s) * mr0 + h01(s) * r1 + h11(s) * mr1;
 }
 
+// March optimizations the GPU shader applies, mirrored here so the tests can
+// pin them: both only change *when* a departing or doomed ray stops
+// integrating, never its verdict or escape direction.
+struct KerrMarchOptions {
+    bool farRuler = true;    // grow the step beyond kFarRadius for outward rays
+    bool captureCut = true;  // stop a plunging ray inside the prograde photon orbit
+};
+
+// Mirrors of FAR_RADIUS / FAR_GROWTH in shaders/blackhole.fs.
+constexpr double kFarRadius = 60.0;
+constexpr double kFarGrowth = 6.0;
+
 inline KerrTrace traceKerrRay(Vec3 origin, Vec3 direction, double a, double stepSize, int maxSteps,
-                              double escapeRadius) {
+                              double escapeRadius, KerrMarchOptions opts = {}) {
     KerrTrace out;
     const KerrRay ray = kerrRayFromCamera(origin, direction, a);
     if (!ray.valid) {
@@ -368,6 +380,7 @@ inline KerrTrace traceKerrRay(Vec3 origin, Vec3 direction, double a, double step
 
     const double uMax = kerrUMax(ray.E, ray.L, ray.Q, a);
     const double thetaT = kerrPolarThetaT(ray.E, ray.L, ray.Q, a);
+    const double rPhotonPro = kerrPhotonOrbitRadius(a, true);
     for (int i = 0; i < maxSteps; ++i) {
         const KerrDerivatives d =
             kerrDerivatives(a, ray.E, ray.L, ray.Q, r, theta, signR, signTheta);
@@ -376,7 +389,17 @@ inline KerrTrace traceKerrRay(Vec3 origin, Vec3 direction, double a, double step
             return out;
         }
         const double cosNow = std::cos(theta);
-        const double dl = kerrStepLength(d, r, theta, thetaT, stepSize, stepSize * 0.6);
+        // Far-field ruler, same gate as the shader: moving outward beyond the
+        // far radius with no turning point between here and 2r (R(2r) > 0), the
+        // geometric cap grows by kFarGrowth. The angular and pole rulers keep
+        // their authority inside kerrStepLength, so the growth only ever
+        // lengthens a step the bending would have allowed anyway.
+        double hRadial = stepSize;
+        if (opts.farRuler && signR > 0 && r > kFarRadius &&
+            kerrRadialPotential(ray.E, ray.L, ray.Q, a, 2.0 * r) > 0.0) {
+            hRadial = std::max(hRadial, kFarGrowth * stepSize);
+        }
+        const double dl = kerrStepLength(d, r, theta, thetaT, hRadial, stepSize * 0.6);
         if (!(dl > 0.0) || !std::isfinite(dl)) {
             out.finite = false;
             return out;
@@ -448,6 +471,16 @@ inline KerrTrace traceKerrRay(Vec3 origin, Vec3 direction, double a, double step
         phi = phiNew;
         out.steps = i + 1;
         out.minRadius = std::min(out.minRadius, r);
+
+        // Capture theorem, same as the shader: inside the prograde photon orbit
+        // -- the smallest radius any photon can turn at -- and moving inward, the
+        // perigee lies below every turning point, so the ray is provably
+        // captured here, not eventually. Without the cut a plunging ray keeps
+        // integrating to its step budget before being declared captured.
+        if (opts.captureCut && signR < 0 && r <= rPhotonPro) {
+            out.captured = true;
+            return out;
+        }
 
         // Horizon: Delta < 0 is exactly the region between the two horizons.
         if (r <= rHorizon || kerrDelta(r, a) <= 0.0) {
